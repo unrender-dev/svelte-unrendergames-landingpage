@@ -5,11 +5,17 @@
   <meta charset="utf-8" />
   <link rel="icon" href="/favicon.png" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
-  <link
-    href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=Inter:wght@400;500;600&display=swap"
-    rel="stylesheet">
+  <!-- Conexões antecipadas com os CDNs de fonte/ícone -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com" crossorigin>
+  <!-- CSS de fontes e ícones sem bloquear a primeira pintura (display=swap) -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@300;400;500;600;700&family=Montserrat:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=Inter:wght@400;500;600&display=swap" media="print" onload="this.media='all'">
+  <noscript>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Orbitron:wght@400;500;600;700;800;900&family=Rajdhani:wght@300;400;500;600;700&family=Montserrat:wght@400;500;600;700&family=Roboto:wght@400;500;700&family=Inter:wght@400;500;600&display=swap">
+  </noscript>
   <title>UNRENDER GAMES</title>
   <script type="importmap">
     {
@@ -23,7 +29,39 @@
   %sveltekit.head%
 </head>
 
-<body>
+<body class="overflow-x-hidden bg-slate-900">
+  <!-- SVG Pixelate Filter for FontAwesome Icons -->
+  <svg style="position: absolute; width: 0; height: 0; pointer-events: none; overflow: hidden;" aria-hidden="true">
+    <defs>
+      <!-- 2px Pixelate (Subtle blockiness, good for small icons) -->
+      <filter id="pixelate-2px" x="-10%" y="-10%" width="120%" height="120%" filterUnits="userSpaceOnUse">
+        <feFlood x="0" y="0" height="1" width="1" result="flood" flood-color="white" />
+        <feComposite width="2" height="2" in="flood" result="composite" />
+        <feTile in="composite" result="tiled" />
+        <feComposite in="SourceGraphic" in2="tiled" operator="in" result="sampled" />
+        <feMorphology in="sampled" operator="dilate" radius="1" result="dilated" />
+      </filter>
+
+      <!-- 3px Pixelate (Medium blockiness, standard icons) -->
+      <filter id="pixelate-3px" x="-10%" y="-10%" width="120%" height="120%" filterUnits="userSpaceOnUse">
+        <feFlood x="0" y="0" height="1" width="1" result="flood" flood-color="white" />
+        <feComposite width="3" height="3" in="flood" result="composite" />
+        <feTile in="composite" result="tiled" />
+        <feComposite in="SourceGraphic" in2="tiled" operator="in" result="sampled" />
+        <feMorphology in="sampled" operator="dilate" radius="1" result="dilated" />
+      </filter>
+
+      <!-- 4px Pixelate (Strong blockiness, large icons) -->
+      <filter id="pixelate-4px" x="-10%" y="-10%" width="120%" height="120%" filterUnits="userSpaceOnUse">
+        <feFlood x="0" y="0" height="2" width="2" result="flood" flood-color="white" />
+        <feComposite width="4" height="4" in="flood" result="composite" />
+        <feTile in="composite" result="tiled" />
+        <feComposite in="SourceGraphic" in2="tiled" operator="in" result="sampled" />
+        <feMorphology in="sampled" operator="dilate" radius="1" result="dilated" />
+      </filter>
+    </defs>
+  </svg>
+
   <div id="svelte">%sveltekit.body%</div>
 </body>
 

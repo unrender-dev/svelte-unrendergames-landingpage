@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    container_name: games_unrender
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3006:3000"
+    environment:
+      - PORT=3000
+      - NODE_ENV=production
+      - COFRE_URL=http://ctrlb_cofre:7700
+      - API_BASE_URL=http://ctrlb_backend:3000
+      - LANDING_PAGE_TOKEN=landing-page-secret-token!1561!5161234!Gjd
+    networks:
+      - caddy-net
+
+networks:
+  caddy-net:
+    external: true

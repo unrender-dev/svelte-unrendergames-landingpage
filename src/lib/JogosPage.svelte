@@ -4,9 +4,19 @@
   import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
   import { Octree } from "three/examples/jsm/math/Octree.js";
   import { Capsule } from "three/examples/jsm/math/Capsule.js";
+  import { gsap } from "gsap";
   import Spinner from "./Spinner.svelte";
-  import { contactModalState } from "./modalStore.js";
+  import {
+    contactModalState,
+    portfolioModalState,
+    hasSeenSplashScreen,
+    globalLoading,
+  } from "$lib/modalStore.js";
+  import { gameProjects } from "./portfolioData.js";
   import ContactModal from "./ContactModal.svelte";
+  import { registerRenderer, unregisterRenderer } from "./debugStore.js";
+  import { createRenderer, captureCanvas } from "./threeRenderer.js";
+  import { createBirdFlock, boundsFromPlayArea } from "./birdFlock.js";
 
   let canvas;
   let scene, camera, renderer;
@@ -16,8 +26,87 @@
   let activeAction, previousAction;
   let clock = new THREE.Clock();
   let isLoading = true;
+  let loadingProgress = 0;
   let isDestroyed = false; // Flag to prevent animation after destroy
   let animationId; // Track animation frame to cancel it properly
+
+  // WebGPU: renderer.compileAsync() cria os pipelines com createRenderPipelineAsync
+  // e já os coloca no cache ANTES de ficarem prontos. Se renderer.render() rodar
+  // nesse intervalo, o backend chama setPipeline(undefined), o render lança
+  // exceção a cada frame e o canvas congela (mapa parado, pássaros parados,
+  // cartuchos que carregaram depois nunca aparecem). Por isso todo pré-compile
+  // passa por warmCompile() e o loop não renderiza enquanto houver compile pendente.
+  let pendingCompiles = 0;
+  let renderErrorCount = 0;
+
+  // Se o GPUDevice cair (driver resetou, processo de GPU do navegador reiniciou,
+  // notebook trocou de GPU…) o three para de renderizar em silêncio e o canvas
+  // fica congelado com o jogo rodando por trás. Aqui recriamos o renderer no
+  // mesmo canvas (device novo) e, se não der, recarregamos a página.
+  let recoveringRenderer = false;
+
+  function watchDeviceLost(r) {
+    if (!r) return;
+    r.onDeviceLost = (info) => {
+      console.warn("[Jogos] GPU perdida, recriando renderer:", info?.message || info);
+      if (r === renderer) recoverRenderer();
+    };
+  }
+
+  async function recoverRenderer() {
+    if (recoveringRenderer || isDestroyed) return;
+    recoveringRenderer = true;
+    const old = renderer;
+    const pixelRatio = old?.getPixelRatio?.() ?? 1;
+    const shadowsOn = old?.shadowMap?.enabled ?? true;
+    const shadowType = old?.shadowMap?.type ?? THREE.PCFShadowMap;
+    renderer = null; // o loop para de renderizar enquanto troca
+    try {
+      old?.dispose?.();
+    } catch {
+      /* device já perdido */
+    }
+    try {
+      const result = await createRenderer({ canvas, antialias: true, alpha: true });
+      if (isDestroyed) {
+        result.renderer.dispose?.();
+        return;
+      }
+      const r = result.renderer;
+      r.setSize(window.innerWidth, window.innerHeight);
+      r.setPixelRatio(pixelRatio);
+      r.shadowMap.enabled = shadowsOn;
+      r.shadowMap.type = shadowType;
+      renderer = r;
+      registerRenderer(r, result.currentRenderer);
+      watchDeviceLost(r);
+      renderErrorCount = 0;
+      console.info("[Jogos] Renderer recriado:", result.currentRenderer);
+    } catch (e) {
+      console.error("[Jogos] Não deu pra recriar o renderer, recarregando a página:", e);
+      if (!isDestroyed) window.location.reload();
+    } finally {
+      recoveringRenderer = false;
+    }
+  }
+
+  function warmCompile(object, targetScene = null) {
+    if (!renderer || !camera) return Promise.resolve();
+    const compileFn = renderer.compileAsync || renderer.compile;
+    if (typeof compileFn !== "function") return Promise.resolve();
+    pendingCompiles++;
+    let result;
+    try {
+      result = compileFn.call(renderer, object, camera, targetScene);
+    } catch (e) {
+      result = Promise.reject(e);
+    }
+    return Promise.resolve(result)
+      .catch((e) => console.warn("[Jogos] Pré-compilação falhou:", e?.message || e))
+      .finally(() => {
+        pendingCompiles = Math.max(0, pendingCompiles - 1);
+      });
+  }
   let cubes = []; // Now cartouches
   let sphere; // Now Miku
   let mikuMixer; // Separate mixer for Miku
@@ -33,14 +122,17 @@
   // Game Constants
   const FIREBALL_COOLDOWN = 1; // 1 second
   const THUNDER_COOLDOWN = 30.0; // 30 seconds
-  const ZOMBIE_RESPAWN_TIME = 15.0; // 15 seconds (Subsequent spawns)
+  const ZOMBIE_RESPAWN_TIME = 30.0; // 30 seconds (Subsequent spawns)
   const INITIAL_ZOMBIE_SPAWN_TIME = 30.0; // 30 seconds (First spawn)
 
   let zombieIdleAction; // Idle animation
+  let zombieLoadStarted = false; // zumbi é carregado depois do loading principal
 
   let zombieWalkAction; // Walk animation
   let isZombieRising = false; // Track if zombie is currently rising
   let zombieRespawnTimer = INITIAL_ZOMBIE_SPAWN_TIME; // Start with longer countdown
+  let playerMaxHp = 100;
+  let playerHp = 100;
   let isZombieChasing = false; // Track chasing state
   let zombieCollider = new Capsule(
     new THREE.Vector3(0, 0, 0),
@@ -51,148 +143,31 @@
   let zombieOnFloor = false;
   let zombieFinalY = 0; // Store final Y position after rising
   let welcomeSign; // Welcome sign model
+  let portfolioCartouche; // Portfolio cartouche model
+  let portfolioModalOpen = false; // Local tracker for isPaused
   let destinationMarker; // Visual marker for click destination
   let markerRipple; // Animated ripple effect
   let textLabels = []; // 3D text labels for cartouches and characters
   let environmentalModels = []; // Environmental decorations (trees, rocks, bushes, etc.)
   let collisionObstacles = []; // Collision spheres for individual meshes
 
-  let birds = [];
   let clouds = [];
   let floatingTexts = []; // Store floating damage numbers
 
-  // Flocking parameters
-  const FLOCK_SIZE = 150;
-  const SEPARATION_RADIUS = 10;
-  const ALIGNMENT_RADIUS = 20;
-  const COHESION_RADIUS = 20;
-  const MAX_SPEED = 0.8;
-  const MAX_FORCE = 0.03;
-  const MIN_HEIGHT = 15;
-  const MAX_HEIGHT = 60;
-  const BOUNDARY_SIZE = 120;
+  // Pássaros na escala do nosso mapa (unrender_forest.glb, clareira ~29x30):
+  //  - skyFlock: bando alto sobre a clareira/falésias; projeta sombra no chão,
+  //    então mesmo na câmera de cima dá pra ver as sombras passando.
+  //  - lowFlock: grupinho baixo, acima das copas, que cruza a visão padrão.
+  let skyFlock = null;
+  let lowFlock = null;
+  const MAP_AREA_FALLBACK = { xmin: -12.5, xmax: 16.5, zmin: -14, zmax: 16 };
 
-  // Reusable vectors to avoid garbage collection
+  // Vetores reutilizáveis (física do zumbi/projéteis) — evita GC por frame
   const _diff = new THREE.Vector3();
-  const _separation = new THREE.Vector3();
-  const _alignment = new THREE.Vector3();
-  const _cohesion = new THREE.Vector3();
   const _vector = new THREE.Vector3();
-  const _lookAtPos = new THREE.Vector3();
 
-  // Cartouche data with comprehensive portfolio information
-  const cartoucheData = [
-    {
-      name: "N64 Classics",
-      description:
-        "Explore the golden era of Nintendo 64 gaming with classic titles and nostalgic memories.",
-      longDescription:
-        "A comprehensive collection showcasing the best of Nintendo 64 era gaming. Features include authentic retro graphics, classic gameplay mechanics, and a nostalgic journey through gaming history. Built with modern web technologies to bring these classics to your browser.",
-      images: [
-        "https://images.unsplash.com/photo-1550745165-9bc0b252726f?w=800",
-        "https://images.unsplash.com/photo-1511512578047-dfb367046420?w=800",
-        "https://images.unsplash.com/photo-1486572788966-cfd3df1f5b42?w=800",
-        "https://media.giphy.com/media/3o7btPCcdNniyf0ArS/giphy.gif", // GIF in carousel
-      ],
-      technologies: ["Three.js", "WebGL", "JavaScript", "Svelte"],
-      links: [
-        { platform: "demo", url: "https://example.com/n64-classics" },
-        {
-          platform: "github",
-          url: "https://github.com/yourusername/n64-classics",
-        },
-        { platform: "itch", url: "https://yourusername.itch.io/n64-classics" },
-      ],
-      year: "2024",
-    },
-    {
-      name: "Adventure Zone",
-      description:
-        "Embark on epic adventures through mysterious lands and challenging quests.",
-      longDescription:
-        "An immersive 3D adventure game featuring procedurally generated worlds, dynamic quests, and engaging storylines. Players explore vast landscapes, solve puzzles, and battle enemies in this action-packed adventure experience.",
-      images: [
-        "https://images.unsplash.com/photo-1538481199705-c710c4e965fc?w=800",
-        "https://images.unsplash.com/photo-1552820728-8b83bb6b773f?w=800",
-        "https://images.unsplash.com/photo-1579546929518-9e396f3cc809?w=800",
-        "https://media.giphy.com/media/l0HlNQ03J5JxX6lva/giphy.gif",
-      ],
-      technologies: ["Unity", "C#", "Blender", "Photoshop"],
-      links: [
-        { platform: "steam", url: "https://store.steampowered.com/app/123456" },
-        {
-          platform: "github",
-          url: "https://github.com/yourusername/adventure-zone",
-        },
-      ],
-      year: "2024",
-    },
-    {
-      name: "Racing Arena",
-      description:
-        "Feel the adrenaline rush with high-speed racing games and competitive challenges.",
-      longDescription:
-        "High-octane racing simulator with realistic physics, multiple tracks, and competitive multiplayer modes. Features stunning graphics, customizable vehicles, and an advanced AI system for challenging opponents.",
-      images: [
-        "https://images.unsplash.com/photo-1547949003-9792a18a2601?w=800",
-        "https://images.unsplash.com/photo-1511919884226-fd3cad34687c?w=800",
-        "https://images.unsplash.com/photo-1492144534655-ae79c964c9d7?w=800",
-        "https://media.giphy.com/media/3oEjI6SIIHBdRxXI40/giphy.gif",
-      ],
-      technologies: ["Unreal Engine", "C++", "Blueprint", "Maya"],
-      links: [
-        { platform: "epic", url: "https://store.epicgames.com/p/racing-arena" },
-        { platform: "steam", url: "https://store.steampowered.com/app/789012" },
-        { platform: "demo", url: "https://example.com/racing-arena" },
-      ],
-      year: "2023",
-    },
-    {
-      name: "Puzzle Palace",
-      description:
-        "Test your mind with brain-teasing puzzles and strategic gameplay.",
-      longDescription:
-        "A collection of mind-bending puzzles and logic challenges designed to test your problem-solving skills. Features progressive difficulty, hint system, and beautiful minimalist design. Perfect for puzzle enthusiasts of all skill levels.",
-      images: [
-        "https://images.unsplash.com/photo-1611996575749-79a3a250f948?w=800",
-        "https://images.unsplash.com/photo-1587731556938-38755b4803a6?w=800",
-        "https://images.unsplash.com/photo-1566576721346-d4a3b4eaeb55?w=800",
-        "https://media.giphy.com/media/3o7TKSjRrfIPjeiVyM/giphy.gif",
-      ],
-      technologies: ["React", "TypeScript", "CSS3", "Node.js"],
-      links: [
-        { platform: "demo", url: "https://example.com/puzzle-palace" },
-        {
-          platform: "github",
-          url: "https://github.com/yourusername/puzzle-palace",
-        },
-        { platform: "itch", url: "https://yourusername.itch.io/puzzle-palace" },
-      ],
-      year: "2023",
-    },
-    {
-      name: "Action Hub",
-      description:
-        "Experience intense action-packed gameplay with explosive combat and thrilling battles.",
-      longDescription:
-        "Fast-paced action game featuring dynamic combat systems, special abilities, and epic boss battles. Combines fluid movement mechanics with strategic gameplay elements for an unforgettable gaming experience.",
-      images: [
-        "https://images.unsplash.com/photo-1542751371-adc38448a05e?w=800",
-        "https://images.unsplash.com/photo-1552820728-8b83bb6b773f?w=800",
-        "https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=800",
-        "https://media.giphy.com/media/3o6Zt6ML6BklcajjsA/giphy.gif",
-      ],
-      technologies: ["Godot", "GDScript", "Aseprite", "GIMP"],
-      links: [
-        { platform: "itch", url: "https://yourusername.itch.io/action-hub" },
-        {
-          platform: "github",
-          url: "https://github.com/yourusername/action-hub",
-        },
-      ],
-      year: "2024",
-    },
-  ];
+  // Cartouche data with comprehensive portfolio information (Imported from portfolioData.js)
+  const cartoucheData = gameProjects;
   let selectedCartouche = null; // Track which cartouche was clicked
   let currentImageIndex = 0; // Track current image in carousel
 
@@ -204,7 +179,6 @@
   let showDialogue = false;
   let isMoving = false;
   let isInDialogue = false;
-  let showHelpModal = false; // Help modal for welcome sign
 
   // Dialogue State
   let displayedText = "";
@@ -277,8 +251,61 @@
   let currentStep = 0;
 
   // Pause State
-  let isPaused = false;
+  let manuallyPaused = false;
+  let contactModalOpen = false;
+  let lastPauseExitTime = 0;
   let showConfigModal = false;
+
+  // Subscribe to contactModalState to track its opening
+  const unsubContactModal = contactModalState.subscribe((state) => {
+    const wasOpen = contactModalOpen;
+    contactModalOpen = !!state.isOpen;
+    if (wasOpen && !contactModalOpen) {
+      manuallyPaused = false;
+      if (typeof window !== "undefined" && !isMobile && isFirstPerson && renderer && document.pointerLockElement !== document.body) {
+        document.body.requestPointerLock().catch(() => {});
+      }
+    }
+  });
+
+  const unsubPortfolioModal = portfolioModalState.subscribe((state) => {
+    const wasOpen = portfolioModalOpen;
+    portfolioModalOpen = !!state.isOpen;
+    if (wasOpen && !portfolioModalOpen) {
+      manuallyPaused = false;
+      if (typeof window !== "undefined" && !isMobile && isFirstPerson && renderer && document.pointerLockElement !== document.body) {
+        document.body.requestPointerLock().catch(() => {});
+      }
+    }
+  });
+
+  // Reactive Pause Logic: Game is paused if ANY modal is open OR manually paused
+  $: isPaused =
+    manuallyPaused ||
+    showModal ||
+    portfolioModalOpen ||
+    showConfigModal ||
+    contactModalOpen ||
+    showGameOverModal ||
+    $globalLoading;
+
+  // Reactive side effects for pausing/resuming
+  $: {
+    if (isPaused) {
+      // Force Zombie to Idle Animation (unless currently rising from ground)
+      if (zombie && !zombie.userData.isDead && !isZombieRising) {
+        if (typeof fadeToActionZombie === "function") {
+          fadeToActionZombie(zombieIdleAction, 0.2);
+        }
+      }
+    } else {
+      // When resuming
+      if (clock) {
+        clock.getDelta(); // Reset clock delta
+      }
+      lastPauseExitTime = Date.now(); // Record when we resumed to prevent immediate re-trigger
+    }
+  }
 
   // Graphics Settings
   let graphicsSettings = {
@@ -306,13 +333,14 @@
 
   function saveGraphicsSettings() {
     isLoading = true; // Show full screen spinner
-    // Simulate delay for "Applying Settings..."
+    // Aplica no próximo frame (antes havia 1 s de espera artificial)
     setTimeout(() => {
       graphicsSettings = { ...tempGraphicsSettings };
       applyGraphicsSettings();
+      globalLoading.set(false);
       isLoading = false;
       showConfigModal = false;
-    }, 1000);
+    }, 60);
   }
 
   function applyGraphicsSettings() {
@@ -321,7 +349,7 @@
     // 1. Resolution (FSR Simulation)
     // Adjust pixel ratio. Standard usage is window.devicePixelRatio (usually 1 or more).
     // We will scale it.
-    const baseRatio = window.devicePixelRatio;
+    const baseRatio = Math.min(window.devicePixelRatio || 1, 2);
     const targetRatio = baseRatio * graphicsSettings.resolution;
     renderer.setPixelRatio(targetRatio);
 
@@ -384,33 +412,29 @@
   }
 
   function togglePause() {
-    if (showGameOverModal) return; // Cannot pause on Game Over (it's already effectively paused)
-    isPaused = !isPaused;
-    if (isPaused) {
-      // Pause music if desired, or keep it running?
-      // "logic stops, animation continues"
-      console.log("Game Paused");
-
-      // Force Zombie to Idle Animation (so he doesn't freeze mid-walk)
-      if (zombie && !zombie.userData.isDead) {
-        // Use existing helper if available, or direct mixer manipulation
-        // We saw fadeToActionZombie earlier
-        if (typeof fadeToActionZombie === "function") {
-          fadeToActionZombie(zombieIdleAction, 0.2);
-        }
-      }
-    } else {
-      console.log("Game Resumed");
-      // Reset clock delta to avoid large jump
-      clock.getDelta();
-    }
+    if (showGameOverModal) return;
+    manuallyPaused = !manuallyPaused;
   }
-
   // VFX Pools - Pre-created to avoid shader compilation stutter
   let fireballGeometry = null;
   let fireballMaterial = null;
   let thunderMaterial = null;
   let thunderGlowMaterial = null;
+
+  // Object Pools
+  const POOL_SIZE = 10;
+  let fireballPool = [];
+  let thunderMeshPool = [];
+  let thunderGlowPool = [];
+  let lightPool = [];
+  
+  // Instanced Meshes for Particles
+  const MAX_PARTICLES = 200;
+  let dustParticleInstancedMesh;
+  let explosionParticleInstancedMesh;
+  let activeDustData = []; // Store life, rotation, velocity
+  let activeExplosionData = [];
+
   let lastStepTime = 0;
   const STEP_INTERVAL = 0.3; // Seconds between steps
 
@@ -431,10 +455,49 @@
   const ROTATION_SPEED = 10;
   const ARRIVAL_THRESHOLD = 0.2;
 
+  // --- Mapa (static/models/map/unrender_forest.glb) ---
+  // Gerado por tools/generate-forest-map.mjs. O mapa já vem cercado naturalmente
+  // (falésias + floresta), então não geramos mais paredes/pedras em runtime.
+  const MAP_URL = "/models/map/unrender_forest.glb";
+  // Malhas do GLB que entram na física (octree). Folhagem fica de fora: as
+  // árvores colidem pelos troncos que vêm na malha "colliders".
+  const MAP_COLLISION_MESHES = new Set(["terrain", "rocks", "colliders"]);
+  const MAP_NO_SHADOW_CAST = new Set(["paths", "trees_far", "terrain_far"]);
+  // Posições fixas – MANTER EM SINCRONIA com POIS em tools/generate-forest-map.mjs
+  // (o gerador deixa essas áreas livres de árvores e pedras).
+  const MAP_POI = {
+    spawn: { x: -0.65, z: 3.62 },
+    contato: { x: -1.4, z: -0.4 },
+    portfolio: { x: 3.0, z: 0.9 },
+    clown: { x: -5.2, z: 2.6 },
+    miku: { x: 1.4, z: 7.3 },
+    welcome: { x: 3.0, z: 4.4 },
+    zombie: { x: 6.2, z: -2.8 },
+  };
+  // Contorno da clareira (extras.playArea do GLB). Trava de segurança: se algo
+  // atravessar a falésia (lag / fps muito baixo), volta pra última posição válida.
+  let playAreaPolygon = null;
+  const _lastSafePlayerPos = new THREE.Vector3(MAP_POI.spawn.x, 0.33, MAP_POI.spawn.z);
+  const _lastSafeZombiePos = new THREE.Vector3();
+  let hasSafeZombiePos = false;
+  const _safeDelta = new THREE.Vector3();
+
+  function isInsidePlayArea(x, z) {
+    const poly = playAreaPolygon;
+    if (!poly) return true;
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0], zi = poly[i][1];
+      const xj = poly[j][0], zj = poly[j][1];
+      if (zi > z !== zj > z && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
   // Physics State
   const worldOctree = new Octree();
-  const rockOctree = new Octree();
-  let rocksGroup = new THREE.Group();
   const playerCollider = new Capsule(
     new THREE.Vector3(-0.65, 0.33, 3.62), // Start (adjusted for -0.02 ground level: 0.33 - 0.35 = -0.02)
     new THREE.Vector3(-0.65, 1.33, 3.62), // End (height 1.0)
@@ -455,12 +518,20 @@
   let isFirstPerson = false;
   let cameraRotation = { x: 0, y: 0 };
 
-  // Player Stats
-  let playerHp = 10;
-  const playerMaxHp = 10;
-  let isPlayerImmune = false;
+  // Player specific state
+  let playerHealth = 100;
+  let playerGold = 0;
+  let inSafeZone = true;
+  let showDamageOverlay = false;
   let playerImmunityTimer = 0;
+  let isPlayerImmune = false;
   let immunityBlinkTimer = 0;
+
+  // Reusable variables for Zombie Physics
+  const _zombieDirection = new THREE.Vector3();
+  const _zombieQuat = new THREE.Quaternion();
+  const _zombieAxis = new THREE.Vector3(0, 1, 0);
+  const _particlePos = new THREE.Vector3();
 
   let showGameOverModal = false;
 
@@ -589,11 +660,7 @@
   function updateShadowCamera(size, mapSize) {
     if (!dirLight) return;
 
-    // Dispose old map to prevent memory leaks and ensure resize
-    if (dirLight.shadow.map) {
-      dirLight.shadow.map.dispose();
-      dirLight.shadow.map = null;
-    }
+    // WebGPURenderer redimensiona o shadow map sozinho quando mapSize muda
 
     dirLight.shadow.camera.top = size;
     dirLight.shadow.camera.bottom = -size;
@@ -610,24 +677,27 @@
   // Shader Code
 
   onMount(() => {
-    init();
-    animate();
+    const setup = async () => {
+      globalLoading.set(true);
+      await init();
+      animate();
+    };
+    setup();
+
+    // Welcome Modal will be opened after loading completes.
+
+    const handleWindowResize = () => {
+      isMobile = window.innerWidth < 768;
+      onWindowResize();
+    };
 
     if (typeof window !== "undefined") {
       isMobile = window.innerWidth < 768;
-      window.addEventListener("resize", () => {
-        isMobile = window.innerWidth < 768;
-        onWindowResize();
-      });
-    } else {
-      window.addEventListener("resize", onWindowResize);
+      window.addEventListener("resize", handleWindowResize);
+      window.addEventListener("keydown", onKeyDown);
+      window.addEventListener("keyup", onKeyUp);
+      document.addEventListener("mousemove", onMouseMove);
     }
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("resize", onWindowResize);
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("keyup", onKeyUp);
-    // Add mouse move listener for pointer lock
-    document.addEventListener("mousemove", onMouseMove);
 
     // Load Sounds
     typeSounds = [
@@ -644,23 +714,22 @@
     shutterSound1 = new Audio("/audio/click.wav");
     shutterSound2 = new Audio("/audio/click2.wav");
 
-    // New Sounds
-    zombieIdleSound = new Audio("/audio/zombie-idle.m4a");
-    zombieHitSound = new Audio("/audio/zombie-hit.m4a");
-    zombieDieSound = new Audio("/audio/zombie-die.m4a");
-    fireballThrowSound = new Audio("/audio/fireball-trow.wav");
-    fireballHitSound = new Audio("/audio/fireball-hit.wav");
-    thunderSound = new Audio("/audio/thunder.m4a");
+    // Sons de combate: só baixam depois que o jogo carregou (ver warmDeferredAudio)
+    const lazyAudio = (url) => {
+      const a = new Audio();
+      a.preload = "none";
+      a.src = url;
+      return a;
+    };
+    zombieIdleSound = lazyAudio("/audio/zombie-idle.m4a");
+    zombieHitSound = lazyAudio("/audio/zombie-hit.m4a");
+    zombieDieSound = lazyAudio("/audio/zombie-die.m4a");
+    fireballThrowSound = lazyAudio("/audio/fireball-trow.wav");
+    fireballHitSound = lazyAudio("/audio/fireball-hit.wav");
+    thunderSound = lazyAudio("/audio/thunder.m4a");
 
-    // New Sounds
-    zombieIdleSound = new Audio("/audio/zombie-idle.m4a");
-    zombieHitSound = new Audio("/audio/zombie-hit.m4a");
-    zombieDieSound = new Audio("/audio/zombie-die.m4a");
-    fireballThrowSound = new Audio("/audio/fireball-trow.wav");
-    fireballHitSound = new Audio("/audio/fireball-hit.wav");
-    thunderSound = new Audio("/audio/thunder.m4a");
-
-    bgMusic = new Audio("/audio/conker-windy-theme.mp3");
+    // 8 MB: nunca pré-carrega, faz streaming quando o play() acontece
+    bgMusic = lazyAudio("/audio/conker-windy-theme.mp3");
     bgMusic.loop = true;
     bgMusic.volume = volBgMusic; // Low background music
 
@@ -688,18 +757,11 @@
     shutterSound2.load();
     shutterSound2.volume = volShutter;
 
-    // Load new sounds
-    zombieIdleSound.load();
     zombieIdleSound.volume = volZombie;
-    zombieHitSound.load();
     zombieHitSound.volume = volZombie;
-    zombieDieSound.load();
     zombieDieSound.volume = volZombie;
-    fireballThrowSound.load();
     fireballThrowSound.volume = volFireball;
-    fireballHitSound.load();
     fireballHitSound.volume = volFireball;
-    thunderSound.load();
     thunderSound.volume = volThunder;
     shutterSound2.volume = volShutter;
 
@@ -718,13 +780,20 @@
     byebyeSound.load();
     shutterSound1.load();
     shutterSound2.load();
-    bgMusic.load();
 
-    // Try to play music immediately
-    bgMusic.play().catch((e) => {
-      console.log("Autoplay prevented:", e);
-      isMusicPlaying = false; // Reset state if autoplay fails
-    });
+    // Try to play music immediately, but muted if still loading
+    if (bgMusic) {
+      const originalMuted = bgMusic.muted;
+      if (isLoading) bgMusic.muted = true;
+      
+      bgMusic.play().then(() => {
+        // If it plays, and we are still loading, keep it muted
+        // It will be unmuted when loading finishes or on interaction
+      }).catch((e) => {
+        console.log("Autoplay prevented:", e);
+        isMusicPlaying = false; // Reset state if autoplay fails
+      });
+    }
 
     if (typeof window !== "undefined") {
       const urlParams = new URLSearchParams(window.location.search);
@@ -733,28 +802,28 @@
         showHud = true;
         showAudioMixer = true;
       }
-
-      window.addEventListener("resize", onWindowResize);
-      window.addEventListener("keydown", onKeyDown);
-      window.addEventListener("keyup", onKeyUp);
-      document.addEventListener("mousemove", onMouseMove);
     }
 
     return () => {
-      // Cleanup handled by onDestroy
+      if (typeof window !== "undefined") {
+        window.removeEventListener("resize", handleWindowResize);
+      }
     };
   });
 
   onDestroy(() => {
     isDestroyed = true;
+    unsubContactModal?.();
+    unsubPortfolioModal?.();
     if (animationId) cancelAnimationFrame(animationId); // Stop the loop immediately
     if (typeof window !== "undefined") {
       window.removeEventListener("resize", onWindowResize);
       window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       document.removeEventListener("mousemove", onMouseMove);
     }
+    
+    unregisterRenderer();
 
     // Stop music
     if (bgMusic) {
@@ -775,17 +844,21 @@
     if (clownMixer) clownMixer.stopAllAction();
     if (zombieMixer) zombieMixer.stopAllAction();
 
-    birds = [];
+    skyFlock?.dispose();
+    lowFlock?.dispose();
+    skyFlock = lowFlock = null;
     clouds = [];
     projectiles = [];
     effects = [];
 
     if (renderer) {
-      renderer.dispose();
-      renderer.forceContextLoss();
+      renderer.dispose?.();
+      renderer.forceContextLoss?.();
       renderer.domElement = null;
       renderer = null;
     }
+
+    portfolioModalState.update((s) => ({ ...s, isOpen: false }));
   });
 
   function disposeNode(node) {
@@ -803,7 +876,7 @@
     }
   }
 
-  function init() {
+  async function init() {
     if (typeof window === "undefined") return;
     // Scene
     scene = new THREE.Scene();
@@ -814,8 +887,6 @@
     scene.background = new THREE.Color(0x87ceeb);
     scene.fog = new THREE.Fog(0x87ceeb, 3000, 4900);
 
-    scene.add(rocksGroup);
-
     // Camera
     camera = new THREE.PerspectiveCamera(
       60,
@@ -823,20 +894,35 @@
       0.01, // Reduced near plane to prevent clipping when close to models
       5000,
     );
-    camera.position.set(0, 10, 15);
-    camera.lookAt(0, 0, 0);
+    camera.position.set(MAP_POI.spawn.x, 5, MAP_POI.spawn.z + 5);
+    camera.lookAt(MAP_POI.spawn.x, 0, MAP_POI.spawn.z);
 
     // Renderer
-    renderer = new THREE.WebGLRenderer({
+    // WebGPU sempre (WebGL só se o WebGPU falhar). A selfie usa captureCanvas(),
+    // então não precisamos de preserveDrawingBuffer (que custa caro no WebGL).
+    const result = await createRenderer({
       canvas,
       antialias: true,
-      preserveDrawingBuffer: true,
       alpha: true,
     });
+    if (isDestroyed) {
+      result.renderer.dispose?.();
+      return;
+    }
+    renderer = result.renderer;
+    const currentRenderer = result.currentRenderer;
+
     renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(window.devicePixelRatio);
+    // DPR travado: telas 3x/4x renderizavam 9–16x pixels sem ganho visual
+    renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio || 1, window.innerWidth < 768 ? 1.25 : 1.75),
+    );
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFShadowMap;
+
+    // Register renderer for global debug overlay
+    registerRenderer(renderer, currentRenderer);
+    watchDeviceLost(renderer);
 
     // Lights (Optimized for Sunny Look)
     const hemiLight = new THREE.HemisphereLight(0xffffff, 0x606060, 2.0);
@@ -848,81 +934,131 @@
     dirLight.castShadow = true;
     dirLight.shadow.bias = -0.0001;
     dirLight.shadow.normalBias = 0.0;
-    dirLight.shadow.mapSize.width = 4096;
-    dirLight.shadow.mapSize.height = 4096;
+    // 2048 cobre bem o frustum de ±40 (o 4096 padrão custava 4x mais por frame)
+    const initialShadowSize = window.innerWidth < 768 ? 1024 : 2048;
+    dirLight.shadow.mapSize.width = initialShadowSize;
+    dirLight.shadow.mapSize.height = initialShadowSize;
     dirLight.shadow.camera.top = 40;
     dirLight.shadow.camera.bottom = -40;
     dirLight.shadow.camera.left = -40;
     dirLight.shadow.camera.right = 40;
     scene.add(dirLight);
 
-    // [OPTIMIZATION] Persistent Warmup Light
-    // Keeps "PointLight" shader permutation active to prevent
-    // massive recompilation when the first Fireball/Thunder is cast.
-    const warmupLight = new THREE.PointLight(0xffaa00, 0.01, 0.1);
-    warmupLight.position.set(0, -10, 0); // Hidden underground
-    scene.add(warmupLight);
+    // Initialize VFX pools (including 2 reusable PointLights) upfront before scene compilation
+    initVFXPools();
 
     createClouds();
-    createBirds();
+    createBirds(MAP_AREA_FALLBACK);
 
     // --- Loading Manager (Synchronize Map + Player) ---
     const manager = new THREE.LoadingManager();
+    // Add a manual lock so manager does not complete prematurely before dynamic loaders start
+    manager.itemStart("waitForDynamicLoaders");
+    manager.onProgress = function (url, itemsLoaded, itemsTotal) {
+      loadingProgress = itemsLoaded / itemsTotal;
+    };
+
+    manager.onError = function (url) {
+      console.error("Erro ao carregar recurso: " + url);
+      // Evita o congelamento eterno se um arquivo falhar
+      isLoading = false;
+      globalLoading.set(false);
+    };
+
     manager.onLoad = function () {
       console.log("Loading complete!");
 
-      // Pre-compile VFX shaders to prevent stutter BEFORE hiding spinner
-      warmupShaders();
-
-      // Attempt audio warmup (might be blocked by browser policy, but good to try)
-      warmupAudio();
+      // O zumbi só aparece depois de 30 s: baixa depois do jogo abrir (–1 MB no loading)
+      if (!zombieLoadStarted) {
+        zombieLoadStarted = true;
+        createZombie(null);
+        warmDeferredAudio();
+      }
 
       isLoading = false;
+      if (bgMusic) bgMusic.muted = false;
 
-      // Fix initial floating/falling: Ensure player is on ground if possible
-      // Or just let physics handle it naturally now that collision is ready.
-      if (model) {
-        // Reset Y speed to avoid accumulated gravity
-        playerVelocity.y = 0;
-        // Optional: Snap to known safe spot?
-        // model.position.y = 10;
-      }
+      // Ensure at least one frame is rendered before hiding global loader
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (!isDestroyed) {
+            globalLoading.set(false);
+          }
+        });
+      });
     };
 
     // Map
     const mapLoader = new GLTFLoader(manager);
-    mapLoader.load("/models/map/low_poly_forest_1.glb", (gltf) => {
+    mapLoader.load(MAP_URL, (gltf) => {
       const map = gltf.scene;
-      map.scale.set(1, 1, 1); // Adjust scale if needed
-      map.position.set(0, 0, 0);
+      map.name = "map_root";
+      map.updateMatrixWorld(true);
+      playAreaPolygon = map.userData.playArea || null;
+      if (playAreaPolygon) {
+        const area = boundsFromPlayArea(playAreaPolygon);
+        skyFlock?.setBounds({ xmin: area.xmin - 10, xmax: area.xmax + 10, zmin: area.zmin - 10, zmax: area.zmax + 10 });
+        lowFlock?.setBounds({ xmin: area.xmin + 2, xmax: area.xmax - 2, zmin: area.zmin + 2, zmax: area.zmax - 2 });
+      }
 
-      map.traverse((child) => {
-        if (child.isMesh) {
-          child.castShadow = true;
-          child.receiveShadow = true;
-          // Ensure all map meshes are identified as part of the environment
-          child.name = "environment_mesh";
-        }
+      // Um único material barato para o mapa inteiro: cor por vértice + flat
+      // shading (visual low poly igual ao atlas do mapa antigo, sem especular).
+      const mapMaterial = new THREE.MeshLambertMaterial({
+        vertexColors: true,
+        flatShading: true,
       });
 
-      map.name = "map_root";
+      // Física: só chão/falésias, pedras e colisores simples (troncos + cerca
+      // invisível no topo das falésias). Nunca vai pra cena = nunca renderiza
+      // nem atrapalha o raycast de clique.
+      const collisionRoot = new THREE.Group();
+      const helperMeshes = [];
+
+      map.traverse((child) => {
+        if (!child.isMesh) return;
+        const meshName = child.name;
+
+        if (MAP_COLLISION_MESHES.has(meshName)) {
+          const physicsMesh = new THREE.Mesh(child.geometry);
+          physicsMesh.applyMatrix4(child.matrixWorld);
+          collisionRoot.add(physicsMesh);
+        }
+
+        if (meshName === "colliders") {
+          helperMeshes.push(child);
+          return;
+        }
+
+        // Normais só pro offset de sombra; o shading é flat (derivadas)
+        child.geometry.computeVertexNormals();
+        child.material = mapMaterial;
+        child.castShadow = !MAP_NO_SHADOW_CAST.has(meshName);
+        child.receiveShadow = true;
+        child.matrixAutoUpdate = false; // mapa é estático
+        child.userData.mapPart = meshName;
+        // Identifica como ambiente (clique pra andar / placeObjectOnGround)
+        child.name = "environment_mesh";
+      });
+      helperMeshes.forEach((m) => m.parent.remove(m));
+
       scene.add(map);
 
       // --- Physics: Populate Octree ---
       // IMPORTANT: Populate Octree immediately when map loads
-      worldOctree.fromGraphNode(map);
-
-      createRockBorder();
-      rockOctree.fromGraphNode(rocksGroup);
+      worldOctree.fromGraphNode(collisionRoot);
 
       // Initialize characters and interactive elements AFTER map is loaded
-      createCartouches();
-      createMiku();
-      createClown();
-      createWelcomeSign();
-      createZombie();
+      createCartouches(manager);
+      createMiku(manager);
+      createClown(manager);
+      createWelcomeSign(manager);
+      createPortfolioCartouche(manager);
+      // createZombie() roda no manager.onLoad (carregamento adiado)
       // createWelcomeSign(); // Removed duplicate
       createDestinationMarker();
+
+      // Release the lock now that dynamically added loaders have started
+      manager.itemEnd("waitForDynamicLoaders");
     });
 
     // Load Player Model
@@ -932,7 +1068,12 @@
       (gltf) => {
         model = gltf.scene;
         model.scale.set(0.66, 0.66, 0.66); // Reduced scale to match map (1/3 smaller)
+        model.position.set(MAP_POI.spawn.x, -0.02, MAP_POI.spawn.z);
         scene.add(model);
+        if (camera) {
+          camera.position.set(MAP_POI.spawn.x, 5, MAP_POI.spawn.z + 5);
+          camera.lookAt(model.position);
+        }
 
         model.traverse((object) => {
           if (object.isMesh) object.castShadow = true;
@@ -996,125 +1137,6 @@
     );
   }
 
-  function createRockBorder() {
-    // Low poly rock geometry
-    const geometry = new THREE.DodecahedronGeometry(1, 0);
-    const material = new THREE.MeshStandardMaterial({
-      color: 0x7a7a7a, // Grey rock color
-      flatShading: true,
-      roughness: 0.8,
-    });
-
-    const range = 60; // Scan range (matches shield radius)
-    const step = 3; // Tighter scan for better continuity
-    const raycaster = new THREE.Raycaster();
-    const down = new THREE.Vector3(0, -1, 0);
-
-    // Map to store valid ground positions: "x,z" -> y
-    const grid = new Map();
-
-    // Pass 1: Scan the grid to find ground
-    for (let x = -range; x <= range; x += step) {
-      for (let z = -range; z <= range; z += step) {
-        raycaster.set(new THREE.Vector3(x, 100, z), down);
-        // Intersect with map meshes
-        const intersects = raycaster.intersectObjects(scene.children, true);
-        const ground = intersects.find(
-          (i) =>
-            i.object.name === "environment_mesh" ||
-            i.object.name === "map_root",
-        );
-
-        if (ground) {
-          // Store valid ground hit
-          grid.set(`${x},${z}`, ground.point.y);
-        }
-      }
-    }
-
-    // Helper function to place a rock
-    const placeRock = (x, y, z, pushX, pushZ) => {
-      const rock = new THREE.Mesh(geometry, material);
-
-      // 1. Position: Push towards the void
-      // We push slightly more to ensure the "thin" rock sits mostly off-cliff or exactly on edge
-      const jitter = 0.5;
-      const pushDist = 0.5; // Adjusted push distance
-      rock.position.set(
-        x + pushX * pushDist + (Math.random() - 0.5) * jitter,
-        y - 0.5 + Math.random() * 0.5,
-        z + pushZ * pushDist + (Math.random() - 0.5) * jitter,
-      );
-
-      // 2. Rotation: Align with the edge
-      // Look at the "void" direction.
-      // After looking: Z-axis points to void. X-axis is along the cliff edge.
-      const targetPos = rock.position
-        .clone()
-        .add(new THREE.Vector3(pushX, 0, pushZ));
-      rock.lookAt(targetPos);
-
-      // Add random roll/tilt for natural look
-      rock.rotateZ((Math.random() - 0.5) * 0.5);
-      rock.rotateX((Math.random() - 0.5) * 0.5);
-
-      // 3. Scale: "Thin but Long" ("in compriment big")
-      // Z (Depth/Thickness): Thin (points to void)
-      // X (Width/Length): Wide (runs along cliff to fill gaps)
-      // Y (Height): Tall
-      const thickness = 1.2 + Math.random() * 0.8; // Thin (~1.2 - 2.0)
-      const length = step * 1.8; // Long enough to overlap neighbors (3 * 1.8 = 5.4)
-      const height = 4.0 + Math.random() * 3.0; // Tall (~4 - 7)
-
-      rock.scale.set(length, height, thickness);
-
-      rock.castShadow = true;
-      rock.receiveShadow = true;
-      rock.name = "environment_mesh"; // Collision integration
-
-      rocksGroup.add(rock);
-    };
-
-    // Pass 2: Detect Edges and Place Rocks
-    grid.forEach((y, key) => {
-      const [sx, sz] = key.split(",").map(Number);
-
-      // Check 4 local neighbors to determine Void direction
-      const neighbors = [
-        { key: `${sx + step},${sz}`, dx: 1, dz: 0 },
-        { key: `${sx - step},${sz}`, dx: -1, dz: 0 },
-        { key: `${sx},${sz + step}`, dx: 0, dz: 1 },
-        { key: `${sx},${sz - step}`, dx: 0, dz: -1 },
-      ];
-
-      // Calculate push direction based on ALL missing neighbors
-      let pushX = 0;
-      let pushZ = 0;
-      let isEdge = false;
-
-      neighbors.forEach((n) => {
-        if (!grid.has(n.key)) {
-          isEdge = true;
-          // If neighbor is void, push rock TOWARDS it
-          pushX += n.dx;
-          pushZ += n.dz;
-        }
-      });
-
-      if (isEdge) {
-        // Normalize push vector
-        const len = Math.sqrt(pushX * pushX + pushZ * pushZ);
-        if (len > 0) {
-          pushX = pushX / len;
-          pushZ = pushZ / len;
-        }
-        placeRock(sx, y, sz, pushX, pushZ);
-      }
-    });
-
-    console.log("Procedural Rock Border generated.");
-  }
-
   function placeObjectOnGround(object, x, z, yOffset = 0) {
     const raycaster = new THREE.Raycaster();
     const start = new THREE.Vector3(x, 50, z);
@@ -1150,46 +1172,34 @@
   function onFirstInteraction() {
     window.removeEventListener("click", onFirstInteraction);
     window.removeEventListener("keydown", onFirstInteraction);
-    warmupAudio();
+    
+    // Ensure background music starts playing and is unmuted if loading is finished
+    if (bgMusic) {
+      if (!isLoading) bgMusic.muted = false;
+      bgMusic.play().catch(() => {});
+      isMusicPlaying = true;
+    }
   }
 
-  function warmupAudio() {
-    console.log("Warming up audio...");
-    // 1. Audio Warmup (Prevent First-Play Lag)
-    const soundsToWarmup = [
-      fireballThrowSound,
-      fireballHitSound,
-      thunderSound,
-      zombieIdleSound,
-      zombieHitSound,
-      zombieDieSound,
-    ];
 
-    soundsToWarmup.forEach((sound) => {
-      if (sound) {
-        // Play at 0 volume to force decoding
-        const originalVol = sound.volume;
-        sound.volume = 0;
-        sound.play().catch((e) => {
-          // If this fails, it's likely user interactions weren't sufficient yet,
-          // but we tried our best.
-          console.warn("Audio warmup skipped:", e);
+  // Baixa os sons de combate em segundo plano, depois que o jogo já abriu
+  function warmDeferredAudio() {
+    const run = () => {
+      [zombieIdleSound, zombieHitSound, zombieDieSound, fireballThrowSound, fireballHitSound, thunderSound]
+        .filter(Boolean)
+        .forEach((a) => {
+          a.preload = "auto";
+          a.load();
         });
-        // Stop immediately
-        setTimeout(() => {
-          sound.pause();
-          sound.currentTime = 0;
-          sound.volume = originalVol;
-        }, 50); // Give it a tiny bit of time to start decoding buffer
-      }
-    });
+    };
+    if ("requestIdleCallback" in window) requestIdleCallback(run, { timeout: 4000 });
+    else setTimeout(run, 1500);
   }
 
-  function warmupShaders() {
-    console.log("Warming up shaders...");
+  function initVFXPools() {
+    console.log("Initializing VFX Pools...");
 
-    // 2. Geometry & Shader Warmup
-    // Pre-create fireball geometry and material
+    // 1. Materials & Geometries
     fireballGeometry = new THREE.IcosahedronGeometry(0.2, 0);
     fireballMaterial = new THREE.MeshLambertMaterial({
       color: 0xff4500,
@@ -1198,91 +1208,83 @@
       emissiveIntensity: 0.5,
     });
 
-    // Pre-create thunder materials
-    thunderMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
-    });
+    const tubeGeo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3([new THREE.Vector3(0,0,0), new THREE.Vector3(0,1,0)]), 10, 0.08, 8, false);
+    const glowGeo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3([new THREE.Vector3(0,0,0), new THREE.Vector3(0,1,0)]), 10, 0.2, 8, false);
+    
+    thunderMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff });
     thunderGlowMaterial = new THREE.MeshBasicMaterial({
       color: 0x00ffff,
       transparent: true,
       opacity: 0.5,
     });
 
-    // Pre-create Particle Material (used in createDust/createParticle)
     const particleMaterial = new THREE.MeshBasicMaterial({
-      color: 0xffaa00,
+      color: 0xffffff, // Color set via instanceColor
       transparent: true,
       opacity: 0.8,
     });
+    const particleGeo = new THREE.BoxGeometry(0.2, 0.2, 0.2);
 
-    // Create invisible dummy objects to force shader compilation
-    const dummyGroup = new THREE.Group();
+    // 2. Build Pools
+    fireballPool = [];
+    thunderMeshPool = [];
+    lightPool = [];
+    activeDustData = [];
+    activeExplosionData = [];
 
-    // A. Fireball
-    const dummyFireball = new THREE.Mesh(fireballGeometry, fireballMaterial);
-    dummyGroup.add(dummyFireball); // Light added below for permutations
+    for (let i = 0; i < POOL_SIZE; i++) {
+      // Fireballs
+      const fb = new THREE.Mesh(fireballGeometry, fireballMaterial);
+      fb.visible = false;
+      scene.add(fb);
+      fireballPool.push({ mesh: fb, active: false });
 
-    // B. Thunder
-    const path = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, 0, 0),
-      new THREE.Vector3(0, 1, 0),
-    ]);
-    const tubeGeo = new THREE.TubeGeometry(path, 10, 0.08, 8, false); // Match runtime segments (10)
-    const dummyThunder = new THREE.Mesh(tubeGeo, thunderMaterial);
-    const dummyThunderGlow = new THREE.Mesh(tubeGeo, thunderGlowMaterial);
-    dummyGroup.add(dummyThunder);
-    dummyGroup.add(dummyThunderGlow);
+      // Thunder
+      const tc = new THREE.Mesh(tubeGeo, thunderMaterial);
+      const tg = new THREE.Mesh(glowGeo, thunderGlowMaterial);
+      tc.visible = false;
+      tg.visible = false;
+      scene.add(tc);
+      scene.add(tg);
+      thunderMeshPool.push({ core: tc, glow: tg, active: false });
+    }
 
-    // C. Particles (BoxGeometry)
-    const boxGeo = new THREE.BoxGeometry(0.2, 0.2, 0.2);
-    const dummyParticle = new THREE.Mesh(boxGeo, particleMaterial);
-    dummyGroup.add(dummyParticle);
+    // Keep PointLight pool small (2 lights max) so fragment shaders stay lightweight
+    const LIGHT_POOL_SIZE = 2;
+    for (let i = 0; i < LIGHT_POOL_SIZE; i++) {
+      const light = new THREE.PointLight(0xffaa00, 0, 10);
+      light.position.set(0, -100, 0);
+      scene.add(light);
+      lightPool.push({ light: light, active: false });
+    }
 
-    // Position: Put them IN FRUSTUM but tiny/invisible to ensure they are processed
-    dummyGroup.position.set(0, -2, 0); // Just below ground
-    dummyGroup.scale.set(0.001, 0.001, 0.001);
-    scene.add(dummyGroup);
+    // 3. Instanced Meshes for Particles
+    dustParticleInstancedMesh = new THREE.InstancedMesh(particleGeo, particleMaterial.clone(), MAX_PARTICLES);
+    explosionParticleInstancedMesh = new THREE.InstancedMesh(particleGeo, particleMaterial.clone(), MAX_PARTICLES);
+    
+    dustParticleInstancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    explosionParticleInstancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
 
-    // [PERMUTATION 1] Base State (WarmupLight only)
-    renderer.compile(scene, camera);
+    // Initialize invisible
+    const dummyMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+    const defaultColor = new THREE.Color(0xffffff);
+    for (let i = 0; i < MAX_PARTICLES; i++) {
+        dustParticleInstancedMesh.setMatrixAt(i, dummyMatrix);
+        dustParticleInstancedMesh.setColorAt(i, defaultColor);
+        explosionParticleInstancedMesh.setMatrixAt(i, dummyMatrix);
+        explosionParticleInstancedMesh.setColorAt(i, defaultColor);
+        activeDustData.push({ active: false });
+        activeExplosionData.push({ active: false });
+    }
 
-    // [PERMUTATION 2] Combat State (WarmupLight + Fireball Light)
-    // Add extra light to simulate "Multiple Lights" scenario
-    const dummyLight = new THREE.PointLight(0xffaa00, 2, 5);
-    dummyFireball.add(dummyLight);
-    renderer.compile(scene, camera);
+    scene.add(dustParticleInstancedMesh);
+    scene.add(explosionParticleInstancedMesh);
 
-    // [PERMUTATION 3] Heavy Combat State (Multiple lights)
-    // Add a few more lights to ensure shader can handle array expansion if dynamic
-    const dummyLight2 = new THREE.PointLight(0x00ffff, 2, 5);
-    const dummyLight3 = new THREE.PointLight(0xff0000, 2, 5);
-    dummyGroup.add(dummyLight2);
-    dummyGroup.add(dummyLight3);
-    renderer.compile(scene, camera);
-
-    // Cleanup
-    scene.remove(dummyGroup);
-    dummyLight.dispose();
-    dummyLight2.dispose();
-    dummyLight3.dispose();
-
-    dummyGroup.traverse((child) => {
-      if (child.isMesh) {
-        if (child.geometry) child.geometry.dispose();
-        // Don't dispose materials we want to keep reusing!
-      }
-    });
-
-    // Clean up temporary geometries
-    tubeGeo.dispose();
-    boxGeo.dispose();
-    particleMaterial.dispose(); // Dispose this temp one
-
-    console.log("VFX warmup complete - shaders pre-loaded");
+    console.log("VFX Pools initialized");
   }
 
-  function createCartouches() {
-    const loader = new GLTFLoader();
+  function createCartouches(manager) {
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
     loader.load("/models/cartouche_n64.glb", (gltf) => {
       const model = gltf.scene;
       model.scale.set(0.083, 0.083, 0.083); // Scaled to 1/3 of previous size (0.25 / 3)
@@ -1301,10 +1303,8 @@
         }
       });
 
-      // Fixed Position: Cartouche
-      const x = -0.8;
-      const z = 1.77;
-      placeObjectOnGround(clone, x, z, 0.5);
+      // Fixed Position: Cartouche (Contato)
+      placeObjectOnGround(clone, MAP_POI.contato.x, MAP_POI.contato.z, 0.5);
 
       // Add custom property for floating animation
       clone.userData = {
@@ -1342,8 +1342,8 @@
     });
   }
 
-  function createMiku() {
-    const loader = new GLTFLoader();
+  function createMiku(manager) {
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
     loader.load("/models/miku-br.glb", (gltf) => {
       const mikuMesh = gltf.scene;
 
@@ -1365,8 +1365,8 @@
       sphere.name = "interactive_sphere";
       sphere.add(mikuMesh);
 
-      // Fixed Position: Miku Container (User specifed)
-      sphere.position.set(0.75, -0.05, 6.8);
+      // Fixed Position: Miku Container
+      sphere.position.set(MAP_POI.miku.x, -0.05, MAP_POI.miku.z);
 
       scene.add(sphere);
 
@@ -1395,20 +1395,35 @@
     });
   }
 
-  function createClown() {
-    const loader = new GLTFLoader();
+  function createClown(manager) {
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
     loader.load("/models/clown.glb", (gltf) => {
       clown = gltf.scene;
+
+      // Log animations for reference
+      if (gltf.animations) {
+        console.group("[Clown] Animations Found");
+        gltf.animations.forEach((anim, i) => {
+          console.log(`Index ${i}: "${anim.name}" duration: ${anim.duration.toFixed(2)}s`);
+        });
+        console.groupEnd();
+      }
+
       // Fixed Position: Clown
-      placeObjectOnGround(clown, -2.88, 2.48, 0);
+      placeObjectOnGround(clown, MAP_POI.clown.x, MAP_POI.clown.z, 0);
       clown.scale.set(0.5, 0.5, 0.5);
 
       clown.traverse((child) => {
         if (child.isMesh) {
           child.castShadow = true;
-          child.receiveShadow = true;
-          // Fix disappearing at edges
-          child.frustumCulled = false;
+          child.receiveShadow = false; // Otimização
+          
+          if (child.geometry) {
+            child.geometry.computeBoundingSphere();
+            if (child.geometry.boundingSphere) {
+              child.geometry.boundingSphere.radius *= 2; 
+            }
+          }
         }
       });
 
@@ -1472,12 +1487,12 @@
     });
   }
 
-  function createWelcomeSign() {
-    const loader = new GLTFLoader();
+  function createWelcomeSign(manager) {
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
     loader.load("/models/map/psx_welcome_sign.glb", (gltf) => {
       welcomeSign = gltf.scene;
-      // Fixed Position: Welcome Sign
-      placeObjectOnGround(welcomeSign, 0.64, 3.39, 0);
+      // Moved Position: Welcome Sign (more to the right and bottom/back)
+      placeObjectOnGround(welcomeSign, MAP_POI.welcome.x, MAP_POI.welcome.z, 0);
       welcomeSign.scale.set(0.56, 0.56, 0.56);
       welcomeSign.rotation.y = Math.PI * 2;
 
@@ -1508,15 +1523,71 @@
 
       const labelPos = new THREE.Vector3(center.x, topY + 0.4, center.z);
 
-      createMultiLineTextLabel(["Bem Vindo!", "Informações"], labelPos);
+      createMultiLineTextLabel(["Informações"], labelPos);
     });
   }
 
-  function createZombie() {
+  function createPortfolioCartouche(manager) {
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
+    loader.load("/models/cartouche_n64.glb", (gltf) => {
+      portfolioCartouche = gltf.scene;
+      portfolioCartouche.scale.set(0.083, 0.083, 0.083);
+
+      portfolioCartouche.traverse((child) => {
+        if (child.isMesh) {
+          child.material = child.material.clone();
+          child.material.color.setHex(0x6fa3ff); // Blue portfolio color
+          child.castShadow = true;
+          child.receiveShadow = true;
+          child.frustumCulled = false;
+        }
+      });
+
+      placeObjectOnGround(portfolioCartouche, MAP_POI.portfolio.x, MAP_POI.portfolio.z, 0.5);
+
+      portfolioCartouche.userData = {
+        initialY: portfolioCartouche.position.y,
+        floatSpeed: 1.2,
+        floatOffset: 0,
+        isPortfolio: true,
+      };
+
+      portfolioCartouche.name = "interactive_portfolio";
+      scene.add(portfolioCartouche);
+      addDynamicHitbox(portfolioCartouche, 0.2);
+      cubes.push(portfolioCartouche);
+
+      collisionObstacles.push({
+        position: portfolioCartouche.position.clone(),
+        radius: 0.3,
+      });
+
+      // Label
+      portfolioCartouche.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(portfolioCartouche);
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      const topY = box.max.y;
+
+      const labelPos = new THREE.Vector3(center.x, topY + 0.3, center.z);
+      createTextLabel("Portfólio", labelPos);
+    });
+  }
+
+  function createZombie(manager) {
     console.log("[Zombie] createZombie called. Loading model...");
-    const loader = new GLTFLoader();
+    const loader = manager ? new GLTFLoader(manager) : new GLTFLoader();
     loader.load("/models/hl1-zombie.glb", (gltf) => {
       const zombieModel = gltf.scene;
+
+      // Log animations for reference
+      if (gltf.animations) {
+        console.group("[Zombie] Animations Found");
+        gltf.animations.forEach((anim, i) => {
+          console.log(`Index ${i}: "${anim.name}" duration: ${anim.duration.toFixed(2)}s`);
+        });
+        console.groupEnd();
+      }
 
       // Initialize Game State
       zombieModel.userData = {
@@ -1531,8 +1602,8 @@
 
       zombieModel.scale.set(0.015, 0.015, 0.015);
 
-      // Position: Right of Miku (Miku is at 0.75, 0, 6.8)
-      placeObjectOnGround(zombieModel, 2.0, 6.8);
+      // Position: clareira própria, longe do spawn e dos NPCs
+      placeObjectOnGround(zombieModel, MAP_POI.zombie.x, MAP_POI.zombie.z);
 
       // Store the final Y position (ground level)
       zombieFinalY = zombieModel.position.y;
@@ -1544,9 +1615,15 @@
       zombieModel.traverse((child) => {
         if (child.isMesh) {
           child.castShadow = true;
-          child.receiveShadow = true;
-          // Fix disappearing at edges
-          child.frustumCulled = false;
+          child.receiveShadow = false; // Otimização pesada de FPS
+          
+          // Corrige o bug de sumir nas bordas da tela sem matar a performance (frustumCulled = false mata a CPU/GPU)
+          if (child.geometry) {
+            child.geometry.computeBoundingSphere();
+            if (child.geometry.boundingSphere) {
+              child.geometry.boundingSphere.radius *= 2; // Expande a área visível
+            }
+          }
         }
       });
 
@@ -1556,6 +1633,16 @@
 
       // Store reference
       zombie = zombieModel;
+
+      // Compila os pipelines do zumbi agora (async), não no primeiro spawn
+      // (o loop de render pausa até terminar, ver warmCompile)
+      if (renderer && camera) {
+        const wasVisible = zombieModel.visible;
+        zombieModel.visible = true;
+        warmCompile(zombieModel, scene).finally(() => {
+          if (zombieModel.userData.isDead) zombieModel.visible = wasVisible;
+        });
+      }
 
       // STRONG STYLE: Disable auto matrix update to prevent mixer from overriding position
       // We will manually update matrix in animate loop if needed, or rely on position writes
@@ -1570,9 +1657,9 @@
       // Hitbox
       addDynamicHitbox(zombieModel, 0.5);
 
-      // Collision System (Static interaction for clicking)
-      // Note: dynamic physics collision is handled by zombieCollider now
+      // Collision System
       collisionObstacles.push({
+        object: zombieModel, // Referência para checar se está vivo ou morto
         position: zombieModel.position,
         radius: 0.35,
       });
@@ -1607,51 +1694,26 @@
         zombieWalkAction = zombieMixer.clipAction(walkClip); // Walking
         zombieWalkAction.setEffectiveTimeScale(2.0); // 2.0x speed
 
+        // Sanitize Attack Animations: Remove Position Tracks (Root Motion)
+        const attackClip0 = gltf.animations[0].clone();
+        attackClip0.tracks = attackClip0.tracks.filter(
+          (t) => !t.name.includes(".position"),
+        );
+        
+        const attackClip1 = gltf.animations[1].clone();
+        attackClip1.tracks = attackClip1.tracks.filter(
+          (t) => !t.name.includes(".position"),
+        );
+
+        zombieModel.userData.attackClips = [attackClip0, attackClip1];
+
         // Configure animations
         zombieRisingAction.setLoop(THREE.LoopOnce, 1);
         zombieRisingAction.clampWhenFinished = true;
 
-        // DO NOT Start rising animation. Wait for timer.
+        // DO NOT Start rising animation. Wait for timer (respawnZombie handles rising & listener).
         console.log("[Zombie] Zombie loaded. Waiting for initial countdown.");
-        // zombieRisingAction.play();
-        // isZombieRising = true;
         isZombieChasing = false;
-
-        // Listen for animation finish
-        zombieMixer.addEventListener("finished", function onRisingFinished(e) {
-          if (e.action === zombieRisingAction) {
-            console.log("[Zombie] Rising animation finished event.");
-            zombieMixer.removeEventListener("finished", onRisingFinished);
-            isZombieRising = false;
-            playZombieIdle();
-
-            // Transition to idle animation
-            zombieIdleAction.reset();
-            zombieIdleAction.play();
-            zombieAction = zombieIdleAction;
-
-            // Sync collider to surface once risen
-            // We can assume he ended up at zombieFinalY
-            zombieVelocity.set(0, 0, 0);
-
-            // Sync collider to the new mesh position!
-            zombieCollider.start.set(
-              zombieModel.position.x,
-              zombieModel.position.y + 0.35,
-              zombieModel.position.z,
-            );
-            zombieCollider.end.set(
-              zombieModel.position.x,
-              zombieModel.position.y + 1.35,
-              zombieModel.position.z,
-            );
-
-            console.log(
-              `[Zombie] Rising finished. Collider synced to Y=${zombieModel.position.y.toFixed(2)}`,
-            );
-          }
-        });
-
         zombieAction = zombieRisingAction;
       }
     });
@@ -1791,7 +1853,7 @@
           if (e.action === action) {
             zombieMixer.removeEventListener("finished", onHitFinished);
             if (!target.userData.isDead) {
-              zombieIdleAction.reset().fadeIn(0.2).play();
+              zombieIdleAction?.reset().fadeIn(0.2).play();
               zombieAction = zombieIdleAction;
             }
           }
@@ -1831,14 +1893,28 @@
       action.play();
       zombieAction = action;
 
-      // Hide after animation finishes
+      // Keep body on the ground after death
       const onDeathFinished = (e) => {
         if (e.action === action) {
           zombieMixer.removeEventListener("finished", onDeathFinished);
-          target.visible = false; // Disappear instantly
         }
       };
       zombieMixer.addEventListener("finished", onDeathFinished);
+
+      // Make the zombie fall like a tree/toy soldier (face plant)
+      gsap.to(target.rotation, {
+        x: target.rotation.x + Math.PI / 2,
+        duration: action.getClip().duration || 1.0,
+        ease: "power2.in",
+        onComplete: () => {
+          // Stay on the floor for 1 second, then disappear
+          setTimeout(() => {
+            if (target.userData.isDead) {
+              target.visible = false;
+            }
+          }, 1000);
+        }
+      });
     } else {
       console.log("Death animation not found, hiding instantly.");
       target.visible = false;
@@ -1862,54 +1938,78 @@
     target.userData.isDead = false;
     target.userData.lastHitAnim = null;
     target.visible = true; // Make visible again
+    target.rotation.x = 0; // Reset rotation so he stands up!
 
     // Position
-    // We need to restore him to ground level if he sank
+    // Sempre levanta no ponto de spawn (longe do spawn do player e dos NPCs)
     // Reuse existing zombieFinalY
+    target.position.x = MAP_POI.zombie.x;
+    target.position.z = MAP_POI.zombie.z;
     target.position.y = zombieFinalY - 2.0; // Start underground again
 
     // Enable collision again?
     // Actually we just pushed the position reference, so if we didn't remove the object reference...
     // Wait, splice(idx, 1) removed the object from the array. We need to re-add.
     collisionObstacles.push({
+      object: target,
       position: target.position,
       radius: 0.35,
     });
 
     // Animation
     if (zombieAction) zombieAction.stop();
-    zombieRisingAction.reset().play();
-    zombieAction = zombieRisingAction;
-    isZombieRising = true;
+    
+    if (zombieRisingAction) {
+      zombieRisingAction.reset().play();
+      zombieAction = zombieRisingAction;
+      isZombieRising = true;
 
-    // The existing animate logic will handle the rising and particle effects!
-    // We just need to trigger the flag.
+      const onRisingFinished = (e) => {
+        if (e.action === zombieRisingAction) {
+          zombieMixer.removeEventListener("finished", onRisingFinished);
+          isZombieRising = false;
+          playZombieIdle();
+          if (zombieIdleAction) {
+            zombieIdleAction.reset().play();
+            zombieAction = zombieIdleAction;
+          }
 
-    // Re-attach listener for idle transition
-    const onRisingFinished = (e) => {
-      if (e.action === zombieRisingAction) {
-        zombieMixer.removeEventListener("finished", onRisingFinished);
-        isZombieRising = false;
-        playZombieIdle();
+          // Sync collider here too!
+          zombieVelocity.set(0, 0, 0);
+          zombieCollider.start.set(
+            target.position.x,
+            target.position.y + 0.35,
+            target.position.z,
+          );
+          zombieCollider.end.set(
+            target.position.x,
+            target.position.y + 1.35,
+            target.position.z,
+          );
+          console.log(`[Zombie] Respawn Rising finished. Collider synced.`);
+        }
+      };
+      zombieMixer.addEventListener("finished", onRisingFinished);
+    } else {
+      isZombieRising = false;
+      target.position.y = zombieFinalY;
+      playZombieIdle();
+      if (zombieIdleAction) {
         zombieIdleAction.reset().play();
         zombieAction = zombieIdleAction;
-
-        // Sync collider here too!
-        zombieVelocity.set(0, 0, 0);
-        zombieCollider.start.set(
-          target.position.x,
-          target.position.y + 0.35,
-          target.position.z,
-        );
-        zombieCollider.end.set(
-          target.position.x,
-          target.position.y + 1.35,
-          target.position.z,
-        );
-        console.log(`[Zombie] Respawn Rising finished. Collider synced.`);
       }
-    };
-    zombieMixer.addEventListener("finished", onRisingFinished);
+      zombieVelocity.set(0, 0, 0);
+      zombieCollider.start.set(
+        target.position.x,
+        target.position.y + 0.35,
+        target.position.z,
+      );
+      zombieCollider.end.set(
+        target.position.x,
+        target.position.y + 1.35,
+        target.position.z,
+      );
+    }
   }
 
   function zombieAttack(target) {
@@ -1932,7 +2032,7 @@
 
     // Select Attack Anim [0] or [1]
     const attackIndex = Math.random() < 0.5 ? 0 : 1;
-    const attackAnim = zombie.userData.gltf.animations[attackIndex];
+    const attackAnim = zombie.userData.attackClips[attackIndex];
 
     if (attackAnim) {
       zombie.userData.isAttacking = true;
@@ -1970,7 +2070,7 @@
           zombie.userData.isAttacking = false;
           console.log("[Zombie] Attack animation finished.");
           if (!zombie.userData.isDead) {
-            zombieIdleAction.reset().fadeIn(0.2).play();
+            zombieIdleAction?.reset().fadeIn(0.2).play();
             zombieAction = zombieIdleAction;
           }
         }
@@ -1982,16 +2082,33 @@
       setTimeout(
         () => {
           if (zombie && zombie.userData.isAttacking) {
-            // Only clear if we are still attacking (didn't get interrupted/finished)
-            // Actually hard to track validity of THIS specific attack logic instance vs a new one.
-            // But isAttacking should be false by now.
-            // We'll trust the event listener primarily, but if it fails...
-            // Let's rely on the takeDamage fix for interruption cases.
+            // Failsafe clear
           }
         },
         duration * 1000 + 500,
       );
+    } else {
+      // Missing animation fallback
+      zombie.userData.isAttacking = true;
+      zombie.userData.attackCooldown = 2.0;
+      
+      // Delay damage impact manually
+      setTimeout(() => {
+        if (isPaused || showGameOverModal) return;
+        if (zombie && !zombie.userData.isDead && model) {
+          const dist = zombie.position.distanceTo(model.position);
+          if (dist < 1.3) {
+            damagePlayer(1);
+          }
+        }
+        
+        // Reset attack state slightly after damage is dealt
+        setTimeout(() => {
+           if (zombie) zombie.userData.isAttacking = false;
+        }, 100);
+      }, 400);
     }
+
   }
 
   function damagePlayer(amount) {
@@ -2279,7 +2396,8 @@
   // createEnvironmentalModels removed
 
   function checkInteraction() {
-    if (showModal || showDialogue || !model) return;
+    // Exhaustive guards: Exit if ANY pause state is active
+    if (isPaused || showGameOverModal || isLoading || !model) return;
 
     // Use a larger proximity threshold for "being near something"
     // But check actual distance to the HITBOX surface for interaction
@@ -2310,7 +2428,10 @@
 
     // Check Cartouches
     for (const cube of cubes) {
+      if (cube === portfolioCartouche) continue; // Skip portfolio cartouche in general loop
       if (isTouching(cube, 0.8)) {
+        // Cooldown check for proximity triggers to prevent re-opening immediately after closing
+        if (Date.now() - lastPauseExitTime < 1500) return;
         // 0.8 meter reach
         // Stop movement
         isMoving = false;
@@ -2319,11 +2440,6 @@
         hideDestinationMarker();
         if (activeAction !== actions["Idle"] && !isPlayingOneShotAnimation) {
           fadeToAction("Idle", 0.2);
-        }
-
-        // Auto-Pause for Reading
-        if (!isPaused) {
-          togglePause(); // This handles the flag and the zombie idle switch
         }
 
         contactModalState.set({ isOpen: true, title: "Jogos" });
@@ -2379,6 +2495,8 @@
 
     // Check Welcome Sign
     if (isTouching(welcomeSign, 1.2)) {
+      // Cooldown check for proximity triggers
+      if (Date.now() - lastPauseExitTime < 1500) return;
       isMoving = false;
       targetPosition = null;
       targetObject = null;
@@ -2396,13 +2514,38 @@
       q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), targetRotation);
       model.quaternion.copy(q);
 
-      // Auto-Pause for Reading
-      if (!isPaused) {
-        togglePause();
-      }
-
-      showHelpModal = true;
+      portfolioModalState.set({ isOpen: true, activeTab: "welcome" });
       return;
+    }
+
+    // Check Portfolio Cartouche (explicit, not part of the generic cubes loop)
+    if (portfolioCartouche) {
+      // Use simpler 2D distance check - floating cartouche hitbox can be unreliable
+      const dx = model.position.x - portfolioCartouche.position.x;
+      const dz = model.position.z - portfolioCartouche.position.z;
+      const dist2D = Math.sqrt(dx * dx + dz * dz);
+      if (dist2D < 1.3) {
+        if (Date.now() - lastPauseExitTime < 1500) return;
+        isMoving = false;
+        targetPosition = null;
+        targetObject = null;
+        hideDestinationMarker();
+        if (activeAction !== actions["Idle"] && !isPlayingOneShotAnimation) {
+          fadeToAction("Idle", 0.2);
+        }
+
+        // Face Cartouche
+        const direction = new THREE.Vector3()
+          .subVectors(portfolioCartouche.position, model.position)
+          .normalize();
+        const targetRotation = Math.atan2(direction.x, direction.z);
+        const q = new THREE.Quaternion();
+        q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), targetRotation);
+        model.quaternion.copy(q);
+
+        portfolioModalState.set({ isOpen: true, activeTab: "jogos" });
+        return;
+      }
     }
   }
 
@@ -2420,9 +2563,12 @@
     // Candidate objects
     const candidates = [
       { obj: sphere, name: "Miku", radius: 1.3 }, // Reduced from 2.0 to match trigger (1.2)
-      { obj: clown, name: "Clown", radius: 1.3 },
-      { obj: welcomeSign, name: "Welcome", radius: 1.3 },
-      ...cubes.map((c) => ({ obj: c, name: "Cartouche", radius: 1.0 })), // Reduced from 1.5 to match trigger (0.8)
+      { obj: clown, name: "Paiaço", radius: 1.3 },
+      { obj: welcomeSign, name: "Bem Vindo", radius: 1.3 },
+      { obj: portfolioCartouche, name: "Portfólio", radius: 1.3 }, // Explicit portfolio candidate
+      ...cubes
+        .filter((c) => c !== portfolioCartouche)
+        .map((c) => ({ obj: c, name: "Cartouche", radius: 1.0 })),
     ];
 
     for (const item of candidates) {
@@ -2471,23 +2617,10 @@
     }
   }
 
-  // Modal Functions
   function closeModal() {
     showModal = false;
     currentProject = null;
     currentImageIndex = 0;
-    // Resume Game
-    if (isPaused) {
-      togglePause();
-    }
-  }
-
-  function closeHelpModal() {
-    showHelpModal = false;
-    // Resume Game
-    if (isPaused) {
-      togglePause();
-    }
   }
 
   function nextImage() {
@@ -2510,12 +2643,20 @@
   }
 
   function onWindowResize() {
+    if (!camera || !renderer) return;
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
   }
 
   function onKeyDown(event) {
+    if (
+      document.activeElement.tagName === "INPUT" ||
+      document.activeElement.tagName === "TEXTAREA"
+    ) {
+      return;
+    }
+
     switch (event.key.toLowerCase()) {
       case "w":
         keys.w = true;
@@ -2530,8 +2671,11 @@
         keys.d = true;
         break;
       case " ":
-        if (activeInteractiveObject && !isMoving) {
-          // If near an object, Space interacts
+        if (activeInteractiveObject) {
+          // If near an object, Space interacts (stop moving first)
+          isMoving = false;
+          targetPosition = null;
+          targetObject = null;
           checkInteraction();
         } else {
           // Otherwise, Jump
@@ -2587,6 +2731,13 @@
   }
 
   function onKeyUp(event) {
+    if (
+      document.activeElement.tagName === "INPUT" ||
+      document.activeElement.tagName === "TEXTAREA"
+    ) {
+      return;
+    }
+
     switch (event.key.toLowerCase()) {
       case "w":
         keys.w = false;
@@ -2699,7 +2850,7 @@
         object.name !== "interactive_sphere" &&
         object.name !== "interactive_clown" &&
         object.name !== "interactive_welcome" &&
-        object.name !== "interactive_welcome" &&
+        object.name !== "interactive_portfolio" &&
         object.name !== "floor" &&
         object.name !== "environment_mesh"
       ) {
@@ -2711,7 +2862,8 @@
         object.name === "interactive_cube" ||
         object.name === "interactive_sphere" ||
         object.name === "interactive_clown" ||
-        object.name === "interactive_welcome"
+        object.name === "interactive_welcome" ||
+        object.name === "interactive_portfolio"
       ) {
         addClickFeedback(object, hit.point);
       }
@@ -2774,8 +2926,11 @@
         targetObject = object;
         isMoving = true;
         showDestinationMarker(targetPosition);
-      } else if (object.name === "interactive_welcome") {
-        // Walk to welcome sign like other interactive objects
+      } else if (
+        object.name === "interactive_welcome" ||
+        object.name === "interactive_portfolio"
+      ) {
+        // Walk to welcome sign or portfolio cartouche
         const direction = new THREE.Vector3()
           .subVectors(object.position, model.position)
           .normalize();
@@ -2951,7 +3106,9 @@
           else if (targetObject.name === "interactive_clown")
             startDialogue("clown");
           else if (targetObject.name === "interactive_welcome")
-            showHelpModal = true;
+            portfolioModalState.set({ isOpen: true, activeTab: "welcome" });
+          else if (targetObject.name === "interactive_portfolio")
+            portfolioModalState.set({ isOpen: true, activeTab: "jogos" });
 
           const dir = new THREE.Vector3()
             .subVectors(targetObject.position, model.position)
@@ -3013,6 +3170,7 @@
 
     // 5. Collision Resolution
     playerCollisions();
+    keepPlayerInPlayArea();
 
     // 6. Sync Model
     model.position.copy(playerCollider.start);
@@ -3037,21 +3195,8 @@
   }
 
   function playerCollisions() {
+    // Mapa inteiro (chão, falésias, pedras, troncos) está num único octree
     const result1 = worldOctree.capsuleIntersect(playerCollider);
-    const result2 = rockOctree.capsuleIntersect(playerCollider);
-
-    let result = null;
-    if (result1 && result2) {
-      // If hitting both, pick the one with greater penetration depth?
-      // Or simply process both sequentially. Sequential is safer for simple collision.
-      // Let's process result1 then result2.
-      // Actually, standard composite handling:
-      result = result1; // Fallback
-    } else if (result1) {
-      result = result1;
-    } else if (result2) {
-      result = result2;
-    }
 
     playerOnFloor = false;
 
@@ -3066,20 +3211,6 @@
       playerCollider.translate(result1.normal.multiplyScalar(result1.depth));
     }
 
-    if (result2) {
-      // Check floor (rocks can be floor too if flat enough)
-      const rockFloor = result2.normal.y > 0.35;
-      playerOnFloor = playerOnFloor || rockFloor;
-
-      if (!rockFloor) {
-        playerVelocity.addScaledVector(
-          result2.normal,
-          -result2.normal.dot(playerVelocity),
-        );
-      }
-      playerCollider.translate(result2.normal.multiplyScalar(result2.depth));
-    }
-
     // Original single-check logic removal
     // if (result) { ... }
 
@@ -3090,6 +3221,9 @@
     // Let's use 3D Sphere vs Capsule for robustness, assuming obstacles are roughly player height.
 
     for (const obstacle of collisionObstacles) {
+      // Ignorar colisão de entidades mortas (ex: zombie)
+      if (obstacle.object && obstacle.object.userData?.isDead) continue;
+
       // Find closest point on capsule line segment to obstacle center
       _vector.copy(obstacle.position); // Obstacle center
       // Obstacle Y might be 0 (ground). If it's 0, sphere is half-buried.
@@ -3151,6 +3285,37 @@
           playerVelocity.sub(_vector);
         }
       }
+    }
+  }
+
+  function keepPlayerInPlayArea() {
+    const p = playerCollider.start;
+
+    // Caiu do mapa (não deveria acontecer): volta pro spawn
+    if (p.y < -10) {
+      playerCollider.start.set(MAP_POI.spawn.x, 0.33, MAP_POI.spawn.z);
+      playerCollider.end.set(MAP_POI.spawn.x, 1.33, MAP_POI.spawn.z);
+      playerVelocity.set(0, 0, 0);
+      _lastSafePlayerPos.copy(playerCollider.start);
+      return;
+    }
+
+    if (isInsidePlayArea(p.x, p.z)) {
+      _lastSafePlayerPos.copy(p);
+      return;
+    }
+
+    // Atravessou a falésia: desfaz o movimento horizontal
+    _safeDelta.subVectors(_lastSafePlayerPos, p);
+    _safeDelta.y = Math.max(0, _safeDelta.y);
+    playerCollider.translate(_safeDelta);
+    playerVelocity.x = 0;
+    playerVelocity.z = 0;
+    if (isMoving) {
+      isMoving = false;
+      targetPosition = null;
+      targetObject = null;
+      hideDestinationMarker();
     }
   }
 
@@ -3612,7 +3777,7 @@
 
       // Capture image
       try {
-        const dataURL = renderer.domElement.toDataURL("image/png");
+        const dataURL = captureCanvas(renderer, scene, camera);
 
         // Create download link
         const link = document.createElement("a");
@@ -3678,7 +3843,7 @@
         laughAction.play();
       }
     } else {
-      fullText = "I wouldnt make a joke with that";
+      fullText = "Eu não faria uma piada com isso...";
       // Play idle animation and keep it
       if (clownActions["idle"]) {
         if (clownActions["waving"]) clownActions["waving"].stop();
@@ -3753,132 +3918,32 @@
     }
   }
 
-  function createBirds() {
-    const birdGeometry = new THREE.ConeGeometry(0.5, 2, 5);
-    birdGeometry.rotateX(Math.PI / 2);
-    const birdMaterial = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      roughness: 0.5,
+  function createBirds(area) {
+    const mobile = window.innerWidth < 768;
+    skyFlock = createBirdFlock(THREE, {
+      count: mobile ? 26 : 48,
+      bounds: { xmin: area.xmin - 10, xmax: area.xmax + 10, zmin: area.zmin - 10, zmax: area.zmax + 10 },
+      minY: 11,
+      maxY: 20,
+      scale: 0.42,
+      palette: "day",
+      castShadow: true,
+      seed: 11,
     });
-
-    for (let i = 0; i < FLOCK_SIZE; i++) {
-      const bird = new THREE.Mesh(birdGeometry, birdMaterial);
-      bird.position.set(
-        (Math.random() - 0.5) * 100,
-        MIN_HEIGHT + Math.random() * 20,
-        (Math.random() - 0.5) * 100,
-      );
-      bird.userData = {
-        velocity: new THREE.Vector3(
-          Math.random() - 0.5,
-          Math.random() - 0.5,
-          Math.random() - 0.5,
-        )
-          .normalize()
-          .multiplyScalar(MAX_SPEED),
-        acceleration: new THREE.Vector3(),
-      };
-
-      const wingGeo = new THREE.BoxGeometry(2, 0.1, 0.5);
-      const wings = new THREE.Mesh(wingGeo, birdMaterial);
-      bird.add(wings);
-      bird.userData.wings = wings;
-      bird.userData.wingPhase = Math.random() * Math.PI;
-
-      scene.add(bird);
-      birds.push(bird);
-    }
-  }
-
-  function flock(bird, flockBirds) {
-    _separation.set(0, 0, 0);
-    _alignment.set(0, 0, 0);
-    _cohesion.set(0, 0, 0);
-    let separationCount = 0;
-    let alignmentCount = 0;
-    let cohesionCount = 0;
-
-    flockBirds.forEach((other) => {
-      if (other !== bird) {
-        const dist = bird.position.distanceTo(other.position);
-
-        if (dist < SEPARATION_RADIUS) {
-          _diff.subVectors(bird.position, other.position);
-          _diff.normalize();
-          _diff.divideScalar(dist);
-          _separation.add(_diff);
-          separationCount++;
-        }
-
-        if (dist < ALIGNMENT_RADIUS) {
-          _alignment.add(other.userData.velocity);
-          alignmentCount++;
-        }
-
-        if (dist < COHESION_RADIUS) {
-          _cohesion.add(other.position);
-          cohesionCount++;
-        }
-      }
+    lowFlock = createBirdFlock(THREE, {
+      count: mobile ? 7 : 12,
+      bounds: { xmin: area.xmin + 2, xmax: area.xmax - 2, zmin: area.zmin + 2, zmax: area.zmax - 2 },
+      // abaixo da câmera padrão (+5) e logo acima das copas da clareira (~4.2)
+      minY: 4.45,
+      maxY: 4.95,
+      scale: 0.32,
+      speed: 2.6,
+      palette: "day",
+      castShadow: true,
+      seed: 23,
     });
-
-    if (separationCount > 0) {
-      _separation.divideScalar(separationCount);
-      _separation.normalize();
-      _separation.multiplyScalar(MAX_SPEED);
-      _separation.sub(bird.userData.velocity);
-      _separation.clampLength(0, MAX_FORCE * 1.5);
-    }
-
-    if (alignmentCount > 0) {
-      _alignment.divideScalar(alignmentCount);
-      _alignment.normalize();
-      _alignment.multiplyScalar(MAX_SPEED);
-      _alignment.sub(bird.userData.velocity);
-      _alignment.clampLength(0, MAX_FORCE);
-    }
-
-    if (cohesionCount > 0) {
-      _cohesion.divideScalar(cohesionCount);
-      _cohesion.sub(bird.position);
-      _cohesion.normalize();
-      _cohesion.multiplyScalar(MAX_SPEED);
-      _cohesion.sub(bird.userData.velocity);
-      _cohesion.clampLength(0, MAX_FORCE);
-    }
-
-    bird.userData.acceleration.add(_separation.multiplyScalar(2.0));
-    bird.userData.acceleration.add(_alignment.multiplyScalar(1.0));
-    bird.userData.acceleration.add(_cohesion.multiplyScalar(1.0));
-
-    if (bird.position.y < MIN_HEIGHT) {
-      bird.userData.acceleration.y += 0.05;
-    }
-    if (bird.position.y > MAX_HEIGHT) {
-      bird.userData.acceleration.y -= 0.02;
-    }
-
-    const distFromCenter = bird.position.length();
-    if (distFromCenter > BOUNDARY_SIZE) {
-      _vector.set(0, 30, 0).sub(bird.position);
-      _vector.normalize().multiplyScalar(0.01);
-      bird.userData.acceleration.add(_vector);
-    }
-  }
-
-  function updateBird(bird, time) {
-    bird.userData.velocity.add(bird.userData.acceleration);
-    bird.userData.velocity.clampLength(0, MAX_SPEED);
-    bird.position.add(bird.userData.velocity);
-    bird.userData.acceleration.set(0, 0, 0);
-
-    _lookAtPos.copy(bird.position).add(bird.userData.velocity);
-    bird.lookAt(_lookAtPos);
-
-    if (bird.userData.wings) {
-      bird.userData.wings.rotation.z =
-        Math.sin(time * 15 + bird.userData.wingPhase) * 0.5;
-    }
+    scene.add(skyFlock.object);
+    scene.add(lowFlock.object);
   }
 
   function updateZombiePhysics(delta) {
@@ -3920,24 +3985,19 @@
 
       // Move towards player
       if (distanceToPlayer > ATTACK_RANGE) {
-        const direction = new THREE.Vector3().subVectors(
-          model.position,
-          zombie.position,
-        );
-        direction.y = 0;
-        direction.normalize();
+        // Use module scoped variables for physics
+        _zombieDirection.subVectors(model.position, zombie.position);
+        _zombieDirection.y = 0;
+        _zombieDirection.normalize();
 
         // Smooth Rotation
-        const targetRotation = Math.atan2(direction.x, direction.z);
-        const q = new THREE.Quaternion().setFromAxisAngle(
-          new THREE.Vector3(0, 1, 0),
-          targetRotation,
-        );
-        zombie.quaternion.slerp(q, 5.0 * delta); // Slerp speed
+        const targetRotation = Math.atan2(_zombieDirection.x, _zombieDirection.z);
+        _zombieQuat.setFromAxisAngle(_zombieAxis, targetRotation);
+        zombie.quaternion.slerp(_zombieQuat, 5.0 * delta); // Slerp speed
 
         // Set Velocity (No momentum, constant speed)
-        zombieVelocity.x = direction.x * ZOMBIE_SPEED;
-        zombieVelocity.z = direction.z * ZOMBIE_SPEED;
+        zombieVelocity.x = _zombieDirection.x * ZOMBIE_SPEED;
+        zombieVelocity.z = _zombieDirection.z * ZOMBIE_SPEED;
 
         // Ensure walking anim
         if (zombieAction !== zombieWalkAction && !zombie.userData.isAttacking) {
@@ -4016,6 +4076,18 @@
       zombieCollisions();
     }
 
+    // Trava de segurança: zumbi nunca sai da clareira
+    if (isInsidePlayArea(zombieCollider.start.x, zombieCollider.start.z)) {
+      _lastSafeZombiePos.copy(zombieCollider.start);
+      hasSafeZombiePos = true;
+    } else if (hasSafeZombiePos) {
+      _safeDelta.subVectors(_lastSafeZombiePos, zombieCollider.start);
+      _safeDelta.y = Math.max(0, _safeDelta.y);
+      zombieCollider.translate(_safeDelta);
+      zombieVelocity.x = 0;
+      zombieVelocity.z = 0;
+    }
+
     // 6. Sync Mesh
     zombie.position.copy(zombieCollider.start);
     zombie.position.y -= 0.35; // Offset for collider center
@@ -4031,7 +4103,6 @@
 
   function zombieCollisions() {
     const result1 = worldOctree.capsuleIntersect(zombieCollider);
-    const result2 = rockOctree.capsuleIntersect(zombieCollider);
 
     zombieOnFloor = false;
 
@@ -4046,18 +4117,6 @@
       zombieCollider.translate(result1.normal.multiplyScalar(result1.depth));
     }
 
-    if (result2) {
-      const rockFloor = result2.normal.y > 0.35;
-      zombieOnFloor = zombieOnFloor || rockFloor;
-      if (!rockFloor) {
-        zombieVelocity.addScaledVector(
-          result2.normal,
-          -result2.normal.dot(zombieVelocity),
-        );
-      }
-      zombieCollider.translate(result2.normal.multiplyScalar(result2.depth));
-    }
-
     // Grounding: If on floor, zero out falling speed to prevent accumulation
     if (zombieOnFloor) {
       zombieVelocity.y = Math.max(0, zombieVelocity.y);
@@ -4069,10 +4128,10 @@
     const prev = zombieAction;
     zombieAction = action;
     if (prev) prev.fadeOut(duration);
-    zombieAction.reset().fadeIn(duration).play();
+    if (zombieAction) zombieAction.reset().fadeIn(duration).play();
   }
 
-  function animate() {
+  async function animate() {
     if (isDestroyed) return;
 
     // Request next frame first
@@ -4084,11 +4143,9 @@
     const delta = Math.min(rawDelta, 0.1);
     const time = clock.getElapsedTime();
 
-    // Update Birds
-    birds.forEach((bird) => {
-      flock(bird, birds);
-      updateBird(bird, time);
-    });
+    // Update Birds (delta-time, sem alocação)
+    skyFlock?.update(delta, time);
+    lowFlock?.update(delta, time);
 
     // Update Clouds
     clouds.forEach((cloud) => {
@@ -4104,7 +4161,7 @@
     if (clownMixer) clownMixer.update(delta);
     // Zombie mixer need to be updated always for idle animation?
     // User said: "animation etc ocnintue"
-    if (zombieMixer) zombieMixer.update(delta);
+    if (zombieMixer && (!isPaused || !isZombieRising)) zombieMixer.update(delta);
 
     // --- PAUSABLE GAME LOGIC ---
     if (!isPaused && !showGameOverModal) {
@@ -4123,13 +4180,13 @@
         // Spawn rate: ~30 particles per second for dramatic effect
         const particleSpawnChance = delta * 30;
         if (Math.random() < particleSpawnChance) {
-          // Create dirt particle at zombie's current position
-          const particlePos = zombie.position.clone();
-          particlePos.y += 0.2; // Slightly above ground
-          particlePos.x += (Math.random() - 0.5) * 0.5; // Random spread
-          particlePos.z += (Math.random() - 0.5) * 0.5;
+          // Create dirt particle at zombie's current position without cloning
+          _particlePos.copy(zombie.position);
+          _particlePos.y += 0.2; // Slightly above ground
+          _particlePos.x += (Math.random() - 0.5) * 0.5; // Random spread
+          _particlePos.z += (Math.random() - 0.5) * 0.5;
 
-          createDust(particlePos);
+          createDust(_particlePos);
         }
       }
 
@@ -4236,6 +4293,16 @@
       }
     }
 
+    if (zombie && isZombieChasing && !zombie.userData.isDead) {
+      if (!zombieWalkAction && !zombie.userData.isAttacking) {
+         zombie.scale.y = 0.015 + Math.sin(time * 15) * 0.001; // Procedural walking bob
+      } else if (!zombie.userData.gltf.animations[0] && zombie.userData.isAttacking) {
+         zombie.scale.y = 0.015 + Math.sin(time * 30) * 0.002; // Procedural attack bob
+      } else {
+         zombie.scale.y = 0.015;
+      }
+    }
+
     // Clown faces player
     if (clown && model) {
       // Create a target position at the same height as the clown to ensure only horizontal rotation
@@ -4302,8 +4369,20 @@
 
     updateInteractionHint();
 
-    if (renderer && scene && camera) {
-      renderer.render(scene, camera);
+    if (renderer && scene && camera && pendingCompiles === 0) {
+      if (renderer.info) renderer.info.reset();
+
+      // init() já foi aguardado: render síncrono (sem await por frame).
+      // try/catch: um erro de render não pode derrubar o resto do frame (HUD, textos).
+      try {
+        renderer.render(scene, camera);
+        renderErrorCount = 0;
+      } catch (e) {
+        renderErrorCount++;
+        if (renderErrorCount === 1 || renderErrorCount % 300 === 0) {
+          console.error(`[Jogos] Erro no render (x${renderErrorCount}):`, e);
+        }
+      }
     }
 
     // Update HUD
@@ -4442,21 +4521,33 @@
   }
 
   function createFireball(start, end) {
-    // Reuse pre-created geometry and material
-    const fireball = new THREE.Mesh(fireballGeometry, fireballMaterial);
-    fireball.position.copy(start);
-    fireball.scale.set(0.3, 0.3, 0.3); // Make it smaller
-    scene.add(fireball);
+    // 1. Get Fireball Mesh
+    const fbPoolItem = fireballPool.find((item) => !item.active);
+    if (!fbPoolItem) return; // Pool empty
+    fbPoolItem.active = true;
+    const fireball = fbPoolItem.mesh;
 
-    // Add light to fireball
-    const light = new THREE.PointLight(0xffaa00, 2, 5);
-    fireball.add(light);
+    fireball.position.copy(start);
+    fireball.scale.set(0.3, 0.3, 0.3);
+    fireball.visible = true;
+
+    // 2. Get Light (if available)
+    const lightPoolItem = lightPool.find((item) => !item.active);
+    let light = null;
+    if (lightPoolItem) {
+      lightPoolItem.active = true;
+      light = lightPoolItem.light;
+      light.color.setHex(0xffaa00);
+      light.intensity = 2;
+      light.position.copy(start); // We'll move it manually instead of adding it as a child to avoid hierarchy rebuilds
+    }
 
     const direction = new THREE.Vector3().subVectors(end, start).normalize();
-    const speed = 8; // Slower speed (was 20)
+    const speed = 8;
 
     projectiles.push({
-      mesh: fireball,
+      poolItem: fbPoolItem,
+      lightPoolItem: lightPoolItem,
       direction: direction,
       speed: speed,
       target: end,
@@ -4465,6 +4556,9 @@
   }
 
   function createThunder(target) {
+    const thunderPoolItem = thunderMeshPool.find((item) => !item.active);
+    if (!thunderPoolItem) return; // Pool empty
+
     const startY = 20;
     const start = target.clone().setY(startY);
     const end = target.clone();
@@ -4477,42 +4571,49 @@
     points.push(current.clone());
 
     for (let i = 0; i < segments; i++) {
-      current.y -= stepY;
-      if (i < segments - 1) {
-        // Add random jagged offset
-        current.x += (Math.random() - 0.5) * 2.0;
-        current.z += (Math.random() - 0.5) * 2.0;
-      } else {
-        // Last point is exactly target
-        current.copy(end);
-      }
-      points.push(current.clone());
+        current.y -= stepY;
+        if (i < segments - 1) {
+            current.x += (Math.random() - 0.5) * 2.0;
+            current.z += (Math.random() - 0.5) * 2.0;
+        } else {
+            current.copy(end);
+        }
+        points.push(current.clone());
     }
 
-    // Create the geometry from points
-    // Using a thick line (TubeGeometry) for the core
-    const path = new THREE.CatmullRomCurve3(points);
-    const geometry = new THREE.TubeGeometry(path, segments, 0.08, 8, false);
-    const thunderCore = new THREE.Mesh(geometry, thunderMaterial);
-    scene.add(thunderCore);
+    // Update geometry in place (much faster than creating new mesh)
+    const curve = new THREE.CatmullRomCurve3(points);
+    // Important: disposing geometry here is okay because it's only geometry data, 
+    // but the material and mesh stay. There is a way to reuse geometry array buffers but 
+    // it's very complex for TubeGeometry. This is still 10x better than full recreation.
+    thunderPoolItem.core.geometry.dispose();
+    thunderPoolItem.glow.geometry.dispose();
+    
+    thunderPoolItem.core.geometry = new THREE.TubeGeometry(curve, segments, 0.08, 8, false);
+    thunderPoolItem.glow.geometry = new THREE.TubeGeometry(curve, segments, 0.2, 8, false);
 
-    // Outer glow (larger tube)
-    const glowGeometry = new THREE.TubeGeometry(path, segments, 0.2, 8, false);
-    const thunderGlow = new THREE.Mesh(glowGeometry, thunderGlowMaterial);
-    scene.add(thunderGlow);
+    thunderPoolItem.core.visible = true;
+    thunderPoolItem.glow.visible = true;
+    thunderPoolItem.active = true;
 
-    // Flash light
-    const light = new THREE.PointLight(0x00ffff, 5, 20);
-    light.position.copy(target).add(new THREE.Vector3(0, 2, 0));
-    scene.add(light);
+    // Get Light
+    const lightPoolItem = lightPool.find((item) => !item.active);
+    let light = null;
+    if (lightPoolItem) {
+        lightPoolItem.active = true;
+        light = lightPoolItem.light;
+        light.color.setHex(0x00ffff);
+        light.intensity = 5;
+        light.position.copy(target).add(new THREE.Vector3(0, 2, 0));
+    }
 
-    // Add to effects list to handle removal
     effects.push({
-      meshes: [thunderCore, thunderGlow],
-      light: light,
-      life: 1.0, // Longer duration for lightning
-      type: "thunder",
+        poolItem: thunderPoolItem,
+        lightPoolItem: lightPoolItem,
+        life: 1.0,
+        type: "thunder",
     });
+
 
     // 5. Area Damage
     if (zombie && !zombie.userData.isDead) {
@@ -4550,95 +4651,68 @@
     }
   }
 
-  function createDust(position) {
-    if (!model) return;
-    // Simple white cube for low poly style
-    const geometry = new THREE.BoxGeometry(0.12, 0.12, 0.12); // Small cubes
-    const material = new THREE.MeshBasicMaterial({
-      color: 0xbc9e4a, // Darkened dust color
-      transparent: true,
-      opacity: 0.8,
-    });
-    const particle = new THREE.Mesh(geometry, material);
-
-    // Spawn at feet with spread
-    particle.position
-      .copy(position)
-      .add(
-        new THREE.Vector3(
-          (Math.random() - 0.5) * 1.0,
-          0.1,
-          (Math.random() - 0.5) * 1.0,
-        ),
-      );
-
-    // Random rotation
-    particle.rotation.set(
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
-    );
-
-    scene.add(particle);
-
-    dustParticles.push({
-      mesh: particle,
-      life: 0.5 + Math.random() * 0.5, // 0.5-1.0s life
-      velocity: new THREE.Vector3(
+  function createInstancedParticle(position, colorHex, isExplosion = false) {
+    if (!dustParticleInstancedMesh || !explosionParticleInstancedMesh) return;
+    
+    // Select correct array and instanced mesh
+    const dataArray = isExplosion ? activeExplosionData : activeDustData;
+    const instancedMesh = isExplosion ? explosionParticleInstancedMesh : dustParticleInstancedMesh;
+    
+    // Find free slot
+    const index = dataArray.findIndex(p => !p.active);
+    if (index === -1) return; // Pool full
+    
+    const pData = dataArray[index];
+    pData.active = true;
+    pData.life = isExplosion ? (0.3 + Math.random() * 0.3) : (0.5 + Math.random() * 0.5);
+    pData.maxLife = pData.life; // Store for fading
+    
+    // Initial State
+    pData.position = position.clone().add(new THREE.Vector3(
+        (Math.random() - 0.5) * (isExplosion ? 0.0 : 1.0),
+        isExplosion ? 0.0 : 0.1,
+        (Math.random() - 0.5) * (isExplosion ? 0.0 : 1.0)
+    ));
+    
+    const speed = isExplosion ? (5 + Math.random() * 5) : 1.0;
+    pData.velocity = new THREE.Vector3(
         (Math.random() - 0.5) * 2,
         Math.random() * 2,
-        (Math.random() - 0.5) * 2,
-      ),
-      rotationSpeed: new THREE.Vector3(
-        Math.random() * 5,
-        Math.random() * 5,
-        Math.random() * 5,
-      ),
-    });
-  }
-
-  function createParticle(position, color) {
-    // Reuse dust logic but with custom colors
-    const geometry = new THREE.BoxGeometry(0.2, 0.2, 0.2);
-    const material = new THREE.MeshBasicMaterial({
-      color: color,
-      transparent: true,
-      opacity: 1.0,
-    });
-    const particle = new THREE.Mesh(geometry, material);
-
-    particle.position.copy(position);
-
-    // Random rotation
-    particle.rotation.set(
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
-      Math.random() * Math.PI,
+        (Math.random() - 0.5) * 2
+    ).normalize().multiplyScalar(isExplosion ? speed : (1 + Math.random()));
+    
+    pData.rotation = new THREE.Euler(
+        Math.random() * Math.PI,
+        Math.random() * Math.PI,
+        Math.random() * Math.PI
     );
+    pData.rotationSpeed = new THREE.Vector3(
+        Math.random() * (isExplosion ? 10 : 5),
+        Math.random() * (isExplosion ? 10 : 5),
+        Math.random() * (isExplosion ? 10 : 5)
+    );
+    pData.scale = 1.0;
 
-    scene.add(particle);
-
-    // Higher speed for explosion
-    const speed = 5 + Math.random() * 5;
-    const velocity = new THREE.Vector3(
-      Math.random() - 0.5,
-      Math.random() - 0.5,
-      Math.random() - 0.5,
-    )
-      .normalize()
-      .multiplyScalar(speed);
-
-    dustParticles.push({
-      mesh: particle,
-      life: 0.3 + Math.random() * 0.3, // Short life
-      velocity: velocity,
-      rotationSpeed: new THREE.Vector3(
-        Math.random() * 10,
-        Math.random() * 10,
-        Math.random() * 10,
-      ),
-    });
+    // Set initial instance data
+    const matrix = new THREE.Matrix4();
+    const quaternion = new THREE.Quaternion().setFromEuler(pData.rotation);
+    matrix.compose(pData.position, quaternion, new THREE.Vector3(1, 1, 1));
+    
+    instancedMesh.setMatrixAt(index, matrix);
+    instancedMesh.setColorAt(index, new THREE.Color(colorHex));
+    instancedMesh.instanceMatrix.needsUpdate = true;
+    instancedMesh.instanceColor.needsUpdate = true;
   }
+
+  function createDust(position) {
+    if (!model) return;
+    createInstancedParticle(position, 0xbc9e4a, false);
+  }
+
+  function createParticle(position, colorHex) {
+    createInstancedParticle(position, colorHex, true);
+  }
+
 
   function createExplosion(position) {
     // 1. Particle Burst
@@ -4648,118 +4722,128 @@
     }
 
     // 2. Flash Light
-    const light = new THREE.PointLight(0xffaa00, 5, 10);
-    light.position.copy(position);
-    scene.add(light);
+    const lightPoolItem = lightPool.find((item) => !item.active);
+    if (lightPoolItem) {
+        lightPoolItem.active = true;
+        const light = lightPoolItem.light;
+        light.color.setHex(0xffaa00);
+        light.intensity = 5;
+        light.position.copy(position);
 
-    // Add to effects to fade out
-    effects.push({
-      light: light,
-      life: 0.2, // Very short flash
-      type: "explosion_flash",
-    });
+        effects.push({
+            lightPoolItem: lightPoolItem,
+            life: 0.2, // Very short flash
+            type: "explosion_flash",
+        });
+    }
   }
 
   function updateVFX(delta) {
     // Update Projectiles
     for (let i = projectiles.length - 1; i >= 0; i--) {
       const p = projectiles[i];
-      p.mesh.position.add(p.direction.clone().multiplyScalar(p.speed * delta));
+      const mesh = p.poolItem.mesh;
+      mesh.position.add(p.direction.clone().multiplyScalar(p.speed * delta));
+      
+      if (p.lightPoolItem) {
+          p.lightPoolItem.light.position.copy(mesh.position);
+      }
 
       // Rotate fireball
       if (p.type === "fireball") {
-        p.mesh.rotation.x += delta * 10;
-        p.mesh.rotation.z += delta * 10;
+        mesh.rotation.x += delta * 10;
+        mesh.rotation.z += delta * 10;
       }
 
       // Check Collision with Zombie
+      let hit = false;
       if (zombie && !zombie.userData.isDead && p.type === "fireball") {
-        // Simple distance check for now
-        // Zombie center is roughly position + height/2
-        const zombieCenter = zombie.position
-          .clone()
-          .add(new THREE.Vector3(0, 1.0, 0));
-        if (p.mesh.position.distanceTo(zombieCenter) < 1.0) {
+        const zombieCenter = zombie.position.clone().add(new THREE.Vector3(0, 1.0, 0));
+        if (mesh.position.distanceTo(zombieCenter) < 1.0) {
           takeDamage(zombie, 5, "fireball");
-          createExplosion(p.mesh.position);
-          playFireballHit();
-          scene.remove(p.mesh);
-          projectiles.splice(i, 1);
-          continue; // Next projectile
+          hit = true;
         }
       }
 
-      // Check if reached target (or close enough)
-      if (p.mesh.position.distanceTo(p.target) < 1.0 || p.mesh.position.y < 0) {
-        createExplosion(p.mesh.position);
+      // Check if reached target or hit
+      if (hit || mesh.position.distanceTo(p.target) < 1.0 || mesh.position.y < 0) {
+        createExplosion(mesh.position);
         playFireballHit();
-        scene.remove(p.mesh);
+        
+        // Return to pool instead of dispose
+        mesh.visible = false;
+        p.poolItem.active = false;
+        if (p.lightPoolItem) {
+            p.lightPoolItem.light.intensity = 0;
+            p.lightPoolItem.light.position.set(0,-100,0);
+            p.lightPoolItem.active = false;
+        }
+        
         projectiles.splice(i, 1);
       }
     }
 
     // Update Effects
     for (let i = effects.length - 1; i >= 0; i--) {
-      const effect = effects[i];
-      effect.life -= delta;
-      if (effect.life <= 0) {
-        if (effect.meshes) {
-          effect.meshes.forEach((m) => {
-            scene.remove(m);
-            if (m.geometry) m.geometry.dispose();
-          });
-        }
-        scene.remove(effect.light);
-        effects.splice(i, 1);
-      }
-    }
-
-    // Update Dust
-    for (let i = dustParticles.length - 1; i >= 0; i--) {
-      const p = dustParticles[i];
-      p.life -= delta * 2.0; // Fade out speed
-
-      p.mesh.position.add(p.velocity.clone().multiplyScalar(delta));
-      p.mesh.scale.multiplyScalar(0.9); // Shrink
-      p.mesh.material.opacity = p.life;
-      p.mesh.rotation.x += p.rotationSpeed.x * delta;
-      p.mesh.rotation.y += p.rotationSpeed.y * delta;
-
-      if (p.life <= 0) {
-        scene.remove(p.mesh);
-        p.mesh.geometry.dispose();
-        p.mesh.material.dispose();
-        dustParticles.splice(i, 1);
-      }
-    }
-    for (let i = effects.length - 1; i >= 0; i--) {
-      const e = effects[i];
-      e.life -= delta;
-      if (e.life <= 0) {
-        if (e.meshes) {
-          e.meshes.forEach((m) => {
-            m.geometry.dispose();
-            m.material.dispose();
-            scene.remove(m);
-          });
-        } else if (e.mesh) {
-          // Legacy support if needed, or just cleanup
-          scene.remove(e.mesh);
-        }
-
-        if (e.light) scene.remove(e.light);
-        effects.splice(i, 1);
-      } else {
-        // Fade out
-        if (e.meshes) {
-          e.meshes.forEach((m) => {
-            if (m.material.transparent) {
-              m.material.opacity = e.life / 0.2;
+        const e = effects[i];
+        e.life -= delta;
+        if (e.life <= 0) {
+            if (e.poolItem) {
+                e.poolItem.core.visible = false;
+                e.poolItem.glow.visible = false;
+                e.poolItem.active = false;
             }
-          });
+            if (e.lightPoolItem) {
+                e.lightPoolItem.light.intensity = 0;
+                e.lightPoolItem.light.position.set(0,-100,0);
+                e.lightPoolItem.active = false;
+            }
+            effects.splice(i, 1);
+        } else {
+            // Fade out
+            if (e.poolItem && e.poolItem.glow.material) {
+                e.poolItem.glow.material.opacity = (e.life / 1.0) * 0.5; // Max opacity is 0.5
+            }
         }
-      }
     }
+
+    // Update Instanced Particles
+    const updateInstancedParticles = (dataArray, instancedMesh, isExplosion) => {
+        if (!instancedMesh) return;
+        let needsUpdate = false;
+        const dummyMatrix = new THREE.Matrix4().makeScale(0,0,0);
+        
+        for (let i = 0; i < dataArray.length; i++) {
+            const p = dataArray[i];
+            if (!p.active) continue;
+            
+            p.life -= delta * (isExplosion ? 1.0 : 2.0);
+            if (p.life <= 0) {
+                p.active = false;
+                instancedMesh.setMatrixAt(i, dummyMatrix); // Hide
+                needsUpdate = true;
+                continue;
+            }
+            
+            p.position.add(p.velocity.clone().multiplyScalar(delta));
+            p.scale *= 0.9;
+            p.rotation.x += p.rotationSpeed.x * delta;
+            p.rotation.y += p.rotationSpeed.y * delta;
+            
+            const matrix = new THREE.Matrix4();
+            const quaternion = new THREE.Quaternion().setFromEuler(p.rotation);
+            matrix.compose(p.position, quaternion, new THREE.Vector3(p.scale, p.scale, p.scale));
+            instancedMesh.setMatrixAt(i, matrix);
+            needsUpdate = true;
+        }
+        
+        if (needsUpdate) {
+            instancedMesh.instanceMatrix.needsUpdate = true;
+        }
+    };
+
+    updateInstancedParticles(activeDustData, dustParticleInstancedMesh, false);
+    updateInstancedParticles(activeExplosionData, explosionParticleInstancedMesh, true);
   }
 
   function showDestinationMarker(position) {
@@ -5019,16 +5103,13 @@
 </script>
 
 <main class="fullscreen">
-  {#if isLoading}
-    <Spinner />
-  {/if}
-
-  <!-- Contact Modal -->
-  <ContactModal />
+  <!-- ContactModal is rendered globally in Nav.svelte, so it's removed here -->
+  <!-- PortfolioModal is rendered globally in Nav.svelte, so it's removed here -->
 
   <canvas
     bind:this={canvas}
     on:click={handleCanvasClick}
+    on:contextmenu|preventDefault
     class:crosshair={attackMode !== null}
   ></canvas>
 
@@ -5053,7 +5134,8 @@
 
     <!-- Jump Button (Right) -->
     <div
-      class="fixed bottom-24 right-8 z-[100] w-20 h-20 bg-white/10 backdrop-blur-md rounded-full border border-white/20 touch-none flex items-center justify-center active:bg-white/30 transition-colors"
+      class="fixed bottom-24 right-8 z-[100] w-20 h-20 bg-white/10 backdrop-blur-md rounded-full border border-white/20 touch-none flex items-center justify-center active:bg-white/30 transition-colors select-none outline-none overflow-hidden"
+      style="-webkit-tap-highlight-color: transparent; transform: translateZ(0);"
       on:touchstart|preventDefault={() => {
         keys.space = true;
       }}
@@ -5108,12 +5190,15 @@
 
   <!-- Pause Button -->
   <button
-    class="fixed top-24 right-4 z-[100] p-3 rounded-full glass-panel text-white hover:bg-white/20 transition-all active:scale-95"
+    class="fixed top-24 right-4 z-[100] p-3 rounded-full glass-panel text-white hover:bg-white/20 transition-all active:scale-95 {showGameOverModal
+      ? 'opacity-50 cursor-not-allowed'
+      : ''}"
     on:click={togglePause}
-    aria-label={isPaused ? "Resume Game" : "Pause Game"}
+    disabled={showGameOverModal}
+    aria-label={manuallyPaused ? "Resume Game" : "Pause Game"}
   >
     <i
-      class="fas {isPaused
+      class="fas {manuallyPaused
         ? 'fa-play'
         : 'fa-pause'} text-xl w-6 h-6 flex items-center justify-center"
     ></i>
@@ -5128,10 +5213,13 @@
     <i class="fas fa-cog text-xl w-6 h-6 flex items-center justify-center"></i>
   </button>
 
+  <!-- Temp button removed to use GlobalFabs -->
+
   <!-- Configuration Modal -->
   {#if showConfigModal}
     <div
-      class="fixed inset-0 z-[70] bg-black/60 backdrop-blur-sm flex items-center justify-center"
+      use:portal
+      class="fixed inset-0 z-[9999] bg-black/60 backdrop-blur-sm flex items-center justify-center"
       on:click|self={() => (showConfigModal = false)}
     >
       <div
@@ -5322,9 +5410,7 @@
   <!-- Zombie Respawn HUD -->
   {#if zombieRespawnTimer > 0}
     <div
-      class="fixed z-50 flex items-center gap-3 glass-panel p-3 rounded-2xl animate-pulse transition-all duration-300 {isMobile
-        ? 'top-44 left-4'
-        : 'top-24 left-40'}"
+      class="fixed z-50 flex items-center gap-3 glass-panel p-3 rounded-2xl animate-pulse transition-all duration-300 top-40 left-4"
       style="border-color: rgba(255, 68, 68, 0.5);"
     >
       <div class="relative w-10 h-10 flex items-center justify-center">
@@ -5345,7 +5431,8 @@
 
   {#if showGameOverModal}
     <div
-      class="fixed inset-0 z-[100] flex items-center justify-center bg-black/80 backdrop-blur-sm"
+      use:portal
+      class="fixed inset-0 z-[9999] flex items-center justify-center bg-black/80 backdrop-blur-sm"
     >
       <div
         class="glass-panel p-8 rounded-3xl text-center flex flex-col items-center gap-6 max-w-sm w-full border border-white/20 shadow-[0_0_50px_rgba(255,0,0,0.3)]"
@@ -5519,92 +5606,6 @@
               {/each}
             </div>
           {/if}
-        </div>
-      </div>
-    </div>
-  {/if}
-
-  <!-- Help Modal -->
-  {#if showHelpModal}
-    <div
-      use:portal
-      class="modal-backdrop"
-      on:click={closeHelpModal}
-      on:keydown={(e) => e.key === "Escape" && closeHelpModal()}
-      role="button"
-      tabindex="-1"
-    >
-      <div
-        class="portfolio-modal help-modal"
-        on:click|stopPropagation
-        on:keydown|stopPropagation
-        role="dialog"
-        aria-modal="true"
-        tabindex="-1"
-      >
-        <!-- Header -->
-        <div class="modal-header">
-          <div>
-            <h2 class="modal-title">Bem Vindo!</h2>
-            <p class="modal-subtitle">Controles e Informações</p>
-          </div>
-          <button
-            class="close-button"
-            on:click={closeHelpModal}
-            aria-label="Close"
-          >
-            ✕
-          </button>
-        </div>
-
-        <!-- Content -->
-        <div class="modal-body help-content">
-          <div class="help-section">
-            <h3><i class="fas fa-gamepad"></i> Controles de Movimento</h3>
-            <ul>
-              <li><strong>W, A, S, D</strong> - Mover personagem</li>
-              <li><strong>Clique no chão</strong> - Andar para o local</li>
-              <li><strong>Espaço</strong> - Pular</li>
-              <li><strong>Shift</strong> - Correr</li>
-            </ul>
-          </div>
-
-          <div class="help-section">
-            <h3><i class="fas fa-magic"></i> Poderes</h3>
-            <ul>
-              <li>
-                <strong>1</strong> - Modo Fireball (Clique no chão para atacar)
-              </li>
-              <li>
-                <strong>2</strong> - Modo Thunder (Clique no chão para atacar)
-              </li>
-              <li><strong>ESC</strong> - Cancelar modo de ataque</li>
-            </ul>
-          </div>
-
-          <div class="help-section">
-            <h3><i class="fas fa-hand-pointer"></i> Interações</h3>
-            <ul>
-              <li>
-                <strong>Clique nos Cartuchos</strong> - Ver projetos do portfólio
-              </li>
-              <li>
-                <strong>Clique na Miku</strong> - Conversar e tirar selfie
-              </li>
-              <li><strong>Clique no Paiaço</strong> - Contar piadas</li>
-              <li><strong>E ou Enter</strong> - Interagir quando próximo</li>
-            </ul>
-          </div>
-
-          <div class="help-section">
-            <h3><i class="fas fa-volume-up"></i> Áudio</h3>
-            <ul>
-              <li>
-                <strong>Ícone de música</strong> - Controlar música de fundo
-              </li>
-              <li><strong>Slider de volume</strong> - Ajustar volume</li>
-            </ul>
-          </div>
         </div>
       </div>
     </div>
@@ -6354,79 +6355,7 @@
     box-shadow: 0 4px 12px rgba(0, 120, 242, 0.4);
   }
 
-  /* Help Modal Specific Styles */
-  .help-modal {
-    max-height: 90vh;
-  }
 
-  .help-content {
-    padding: 1.5rem;
-    overflow-y: auto;
-    overflow-x: hidden;
-  }
-
-  .help-content::-webkit-scrollbar {
-    width: 8px;
-  }
-
-  .help-content::-webkit-scrollbar-track {
-    background: rgba(0, 0, 0, 0.2);
-    border-radius: 4px;
-  }
-
-  .help-content::-webkit-scrollbar-thumb {
-    background: rgba(100, 150, 255, 0.5);
-    border-radius: 4px;
-  }
-
-  .help-content::-webkit-scrollbar-thumb:hover {
-    background: rgba(100, 150, 255, 0.7);
-  }
-
-  .help-section {
-    margin-bottom: 1.5rem;
-  }
-
-  .help-section:last-child {
-    margin-bottom: 0;
-  }
-
-  .help-section h3 {
-    color: #6fa3ff;
-    font-size: 1rem;
-    margin-bottom: 0.75rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    text-shadow: 0 0 8px rgba(111, 163, 255, 0.4);
-  }
-
-  .help-section h3 i {
-    font-size: 1.1rem;
-  }
-
-  .help-section ul {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  .help-section li {
-    padding: 0.5rem 0;
-    color: rgba(255, 255, 255, 0.9);
-    font-size: 0.9rem;
-    line-height: 1.5;
-    border-bottom: 1px solid rgba(100, 150, 255, 0.1);
-  }
-
-  .help-section li:last-child {
-    border-bottom: none;
-  }
-
-  .help-section strong {
-    color: #a0c4ff;
-    font-weight: 600;
-  }
 
   /* Responsive Styles */
   @media (max-width: 768px) {
@@ -6483,33 +6412,36 @@
       font-size: 1.5rem;
     }
 
-    /* Help Modal Mobile Styles */
-    .help-modal {
-      max-height: 85vh;
-      height: auto;
-    }
-
-    .help-content {
+    /* Responsive Dialogue Modal */
+    .dialogue-container {
       padding: 1rem;
-      max-height: calc(85vh - 80px);
     }
 
-    .help-section {
-      margin-bottom: 1.25rem;
+    .dialogue-box {
+      padding: 1rem;
+      width: 95%;
     }
 
-    .help-section h3 {
-      font-size: 0.75rem;
+    .speaker-name {
+      font-size: 0.9rem;
     }
 
-    .help-section h3 i {
-      font-size: 0.85rem;
+    .dialogue-content {
+      font-size: 0.7rem;
     }
 
-    .help-section li {
-      font-size: 0.65rem;
-      padding: 0.4rem 0;
-      line-height: 1.4;
+    .dialogue-buttons {
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .dialogue-btn {
+      padding: 0.6rem 1rem;
+      font-size: 0.7rem;
+      flex: 1 1 auto;
+      justify-content: center;
+      text-align: center;
     }
   }
 
@@ -6532,39 +6464,35 @@
       font-size: 0.5rem;
     }
 
-    /* Help Modal Extra Small Screen Styles */
-    .help-modal {
-      max-height: 90vh;
-    }
 
-    .help-content {
-      padding: 0.75rem;
-      max-height: calc(90vh - 70px);
-    }
-
-    .help-section {
-      margin-bottom: 1rem;
-    }
-
-    .help-section h3 {
-      font-size: 0.65rem;
-      gap: 0.35rem;
-    }
-
-    .help-section h3 i {
-      font-size: 0.75rem;
-    }
-
-    .help-section li {
-      font-size: 0.55rem;
-      padding: 0.35rem 0;
-      line-height: 1.3;
-    }
 
     .close-button {
       width: 2rem;
       height: 2rem;
       font-size: 1.2rem;
+    }
+
+    /* Dialogue Modal 480px overrides */
+    .dialogue-container {
+      padding: 0.5rem;
+    }
+
+    .dialogue-box {
+      padding: 0.75rem;
+      width: 100%;
+      border-width: 2px;
+      border-radius: 0.5rem;
+    }
+
+    .dialogue-buttons {
+      flex-direction: column;
+      gap: 0.5rem;
+    }
+
+    .dialogue-btn {
+      width: 100%;
+      padding: 0.5rem;
+      font-size: 0.65rem;
     }
   }
 

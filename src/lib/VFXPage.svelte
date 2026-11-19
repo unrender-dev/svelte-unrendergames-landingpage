@@ -1,8 +1,10 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
+  import { globalLoading } from './modalStore.js';
 
   // Prevent body scrolling while this fullscreen page is mounted
   onMount(() => {
+    globalLoading.set(false);
     document.documentElement.style.overflow = 'hidden';
     document.body.style.overflow = 'hidden';
     document.body.style.overflowX = 'hidden';

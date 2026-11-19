@@ -33,17 +33,26 @@
     function startAutoplay() {
         stopAutoplay();
         if (!videoPlayed) {
-            intervalId = setInterval(() => {
+            const currentSlide = slides[currentIndex];
+            if (currentSlide && currentSlide.waitForEnd) {
+                return; // Wait for the 'ended' event
+            }
+            
+            const duration = (currentSlide && currentSlide.duration) ? currentSlide.duration : autoplayInterval;
+            
+            intervalId = setTimeout(function tick() {
                 if (!isHovering && !videoPlayed) {
                     nextSlide();
+                } else {
+                    intervalId = setTimeout(tick, 1000);
                 }
-            }, autoplayInterval);
+            }, duration);
         }
     }
 
     function stopAutoplay() {
         if (intervalId) {
-            clearInterval(intervalId);
+            clearTimeout(intervalId);
             intervalId = null;
         }
     }
@@ -164,6 +173,16 @@
                                 class="w-full h-full object-cover"
                             />
                         {/if}
+                    {:else if slide.type === "localVideo"}
+                        <video
+                            src={slide.src}
+                            class="w-full h-full object-cover"
+                            autoplay
+                            loop={!slide.waitForEnd}
+                            muted
+                            playsinline
+                            on:ended={() => { if (slide.waitForEnd) nextSlide(); }}
+                        ></video>
                     {/if}
 
                     <!-- Label Overlay -->

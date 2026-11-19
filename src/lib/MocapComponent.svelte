@@ -25,7 +25,7 @@
             this.root = null;
         }
         async init() {
-            const url = "https://assets.codepen.io/9177687/raccoon_head.glb";
+            const url = "/models/raccoon_head.glb";
             const gltf = await new Promise((resolve, reject) => {
                 const loader = new this.GLTFLoader();
                 loader.load(
@@ -355,8 +355,25 @@
         }
     };
 
+    let visibilityObserver;
     onMount(() => {
-        initAndLoop();
+        // MindAR + three 0.160 (WebGL, exigência da lib de AR) são pesados:
+        // só baixa quando o bloco chega perto da tela.
+        if ("IntersectionObserver" in window && container) {
+            visibilityObserver = new IntersectionObserver(
+                (entries) => {
+                    if (entries.some((e) => e.isIntersecting)) {
+                        visibilityObserver.disconnect();
+                        visibilityObserver = null;
+                        initAndLoop();
+                    }
+                },
+                { rootMargin: "300px" },
+            );
+            visibilityObserver.observe(container);
+        } else {
+            initAndLoop();
+        }
         resizeObserver = new ResizeObserver(() => {
             handleResize();
         });
@@ -366,6 +383,7 @@
     });
 
     onDestroy(() => {
+        visibilityObserver?.disconnect();
         stopCamera(); // logic to stop
         if (resizeObserver) resizeObserver.disconnect();
     });
@@ -378,7 +396,7 @@
     <img
         src="/images/raccoon-scene.jpg"
         alt="Background"
-        class="absolute top-0 left-0 w-full h-full object-cover blur-sm z-0"
+        class="absolute top-0 left-0 w-full h-full object-cover blur-sm z-0 rounded-[2.5rem]"
     />
 
     <!-- Container for MindAR -->
@@ -457,9 +475,9 @@
 
     {#if !isRunning}
         <img
-            src="/images/mocap.gif"
+            src="/images/mocap.webp"
             alt="Mocap Preview"
-            class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-full h-full object-cover pointer-events-none z-20"
+            class="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 w-full h-full object-cover pointer-events-none z-20 rounded-[2.5rem]"
         />
     {/if}
 

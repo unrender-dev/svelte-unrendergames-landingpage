@@ -2,19 +2,47 @@
     import { onMount } from "svelte";
     import { page } from "$app/stores";
     import ContactModal from "./ContactModal.svelte";
-    import { contactModalState } from "./modalStore.js";
+    import PortfolioModal from "./PortfolioModal.svelte";
+    import IframeModal from "./IframeModal.svelte";
+    import {
+        contactModalState,
+        hasSeenSplashScreen,
+        globalLoading,
+        portfolioModalState,
+    } from "$lib/modalStore.js";
 
     let isScrolled = false;
     let isMobileMenuOpen = false;
     let windowWidth = 1400; // Default to desktop size
+    let isMobileServicesOpen = false;
 
     $: isContactOpen = $contactModalState.isOpen;
-    $: isMobile = windowWidth < 1300;
+    $: isMobile = windowWidth < 1024;
 
-    // Force white background on Home (/) and Jogos (/jogos) pages
-    // Checks for exact match on / or if it starts with /jogos
+    // Force white background on Home (/), Jogos (/jogos) and Web Interativa pages
+    // Checks for exact match on / or if it starts with /jogos or /web-interativa
     $: isAlwaysSolid =
-        $page.url.pathname === "/" || $page.url.pathname.startsWith("/jogos");
+        $page.url.pathname === "/" ||
+        $page.url.pathname.startsWith("/jogos") ||
+        $page.url.pathname.startsWith("/fortnite") ||
+        $page.url.pathname.startsWith("/roblox") ||
+        $page.url.pathname.startsWith("/metahuman") ||
+        $page.url.pathname.startsWith("/audiovisual") ||
+        $page.url.pathname.startsWith("/vfx") ||
+        $page.url.pathname.startsWith("/vr") ||
+        $page.url.pathname.startsWith("/web-interativa") ||
+        $page.url.pathname.startsWith("/gamificacao") ||
+        $page.url.pathname.startsWith("/loja");
+
+    $: isServiceActive = [
+        "/vr", "/audiovisual", "/gamificacao",
+        "/fortnite", "/roblox", "/web-interativa"
+    ].some(path => $page.url.pathname.startsWith(path));
+
+    const getMobileLinkClass = (isActive) => `block px-6 py-3 font-medium transition-colors border-l-4 hover:bg-gray-50 hover:text-unrender-accent hover:border-unrender-accent ${isActive ? 'text-unrender-accent border-unrender-accent bg-gray-50' : 'text-gray-800 border-transparent'}`;
+    const getMobileBtnClass = (isActive) => `flex items-center justify-between w-full px-6 py-3 font-medium transition-colors border-l-4 hover:bg-gray-50 hover:text-unrender-accent hover:border-unrender-accent bg-transparent border-0 ${isActive ? 'text-unrender-accent border-unrender-accent bg-gray-50' : 'text-gray-800 border-transparent'}`;
+    const getMobileSubLinkClass = (isActive) => `block px-6 py-2 transition-colors hover:text-unrender-accent ${isActive ? 'text-unrender-accent font-medium' : 'text-gray-700'}`;
+    const getDesktopSubLinkClass = (isActive) => `block px-4 py-2 text-sm transition-colors hover:bg-gray-50 hover:text-unrender-accent ${isActive ? 'text-unrender-accent bg-gray-50 font-medium' : 'text-gray-700'}`;
 
     // Determine if we should show the solid navbar style
     $: showSolidNav = isScrolled || isAlwaysSolid;
@@ -35,8 +63,7 @@
         else if (path.includes("roblox")) title = "Roblox";
         else if (path.includes("jogos")) title = "Jogos";
         else if (path.includes("web-interativa")) title = "Web Interativa";
-        else if (path.includes("modelagem-3d")) title = "Modelagem 3D";
-        else if (path.includes("audiovisual")) title = "AudioVisual";
+        else if (path.includes("audiovisual")) title = "Audiovisual";
 
         contactModalState.set({ isOpen: true, title });
     }
@@ -47,7 +74,10 @@
 
     // Navigation helper to handle both scrolling and closing menu
     function handleNavigation() {
-        closeMobileMenu();
+        setTimeout(() => {
+            closeMobileMenu();
+            // isMobileServicesOpen = false; removed to preserve accordion state
+        }, 150);
     }
 
     onMount(() => {
@@ -84,10 +114,29 @@
             window.removeEventListener("keydown", handleKey);
         };
     });
+
+    // --- Query Param Auto-Open Logic ---
+    let hasCheckedQueryParam = false;
+
+    // Reactively watch for the right conditions to auto-open the modal
+    $: if (
+        !hasCheckedQueryParam &&
+        $hasSeenSplashScreen &&
+        !$globalLoading &&
+        $page.url.searchParams.has("portfolio")
+    ) {
+        hasCheckedQueryParam = true;
+        // Small delay to ensure any existing animations (like Splash Screen exit or page entrance)
+        // are sufficiently advanced or completed before the modal pops in.
+        setTimeout(() => {
+            // Default to 'jogos' tab when explicitly requested via URL
+            portfolioModalState.set({ isOpen: true, activeTab: "jogos" });
+        }, 300);
+    }
 </script>
 
 <nav
-    class="fixed top-0 left-0 right-0 z-[200] transition-all duration-300 navbar"
+    class="fixed top-0 left-0 right-0 z-[1000] transition-all duration-300 navbar"
     class:bg-white={showSolidNav}
     class:shadow-lg={showSolidNav}
     class:scrolled={showSolidNav}
@@ -123,7 +172,9 @@
                 aria-label="Toggle navigation"
             >
                 <svg
-                    class="w-6 h-6 navbar-toggler-icon text-gray-900"
+                    class="w-6 h-6 transition-colors duration-300"
+                    class:text-gray-900={showSolidNav || isMobileMenuOpen}
+                    class:text-white={!showSolidNav && !isMobileMenuOpen}
                     fill="none"
                     stroke="currentColor"
                     viewBox="0 0 24 24"
@@ -147,6 +198,7 @@
                     <li>
                         <a
                             class="transition-colors hover:text-unrender-accent nav-link"
+                            class:active={$page.url.pathname === "/"}
                             class:text-gray-900={showSolidNav}
                             class:text-white={!showSolidNav}
                             href="/">Início</a
@@ -155,59 +207,98 @@
                     <li>
                         <a
                             class="transition-colors hover:text-unrender-accent nav-link"
+                            class:active={$page.url.pathname.startsWith("/jogos")}
                             class:text-gray-900={showSolidNav}
                             class:text-white={!showSolidNav}
                             href="/jogos">Jogos</a
                         >
                     </li>
-                    <!--
-                        Temporarily hidden: "Web Interativa" is not ready for public
-                        use. To re-enable, remove this comment block (restore the
-                        <li> + <a href="/web-interativa">...</a> element).
-                        Date: 2026-02-04
-                    -->
-                    <!--
+
+                    <li class="relative group">
+                        <button
+                            type="button"
+                            class="flex items-center space-x-1 transition-colors hover:text-unrender-accent nav-link bg-transparent border-0 p-0"
+                            class:active={isServiceActive}
+                            class:text-gray-900={showSolidNav}
+                            class:text-white={!showSolidNav}
+                        >
+                            <span>Serviços</span>
+                            <svg
+                                class="w-4 h-4 transition-transform duration-200 group-hover:rotate-180"
+                                fill="none"
+                                stroke="currentColor"
+                                viewBox="0 0 24 24"
+                            >
+                                <path
+                                    stroke-linecap="round"
+                                    stroke-linejoin="round"
+                                    stroke-width="2"
+                                    d="M19 9l-7 7-7-7"
+                                />
+                            </svg>
+                        </button>
+
+                        <div
+                            class="absolute left-0 pt-4 w-48 z-[250] opacity-0 translate-y-2 pointer-events-none group-hover:opacity-100 group-hover:translate-y-0 group-hover:pointer-events-auto transition-all duration-200"
+                            style="top: 100%;"
+                        >
+                            <div
+                                class="bg-white rounded-md shadow-xl py-2 border border-gray-100"
+                            >
+                                <a
+                                    href="/jogos"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/jogos'))}
+                                    on:click={handleNavigation}>Jogos</a
+                                >
+                                <a
+                                    href="/vr"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/vr'))}
+                                    on:click={handleNavigation}>VR/AR</a
+                                >
+                                <a
+                                    href="/audiovisual"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/audiovisual'))}
+                                    on:click={handleNavigation}
+                                    >Audiovisual</a
+                                >
+                                <a
+                                    href="/gamificacao"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/gamificacao'))}
+                                    on:click={handleNavigation}
+                                    >Gamificação</a
+                                >
+                                <a
+                                    href="/fortnite"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/fortnite'))}
+                                    on:click={handleNavigation}>Fortnite</a
+                                >
+                                <a
+                                    href="/roblox"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/roblox'))}
+                                    on:click={handleNavigation}>Roblox</a
+                                >
+
+                                <a
+                                    href="/web-interativa"
+                                    class={getDesktopSubLinkClass($page.url.pathname.startsWith('/web-interativa'))}
+                                    on:click={handleNavigation}>Web Interativa</a
+                                >
+                            </div>
+                        </div>
+                    </li>
+
                     <li>
                         <a
                             class="transition-colors hover:text-unrender-accent nav-link"
+                            class:active={$page.url.pathname.startsWith("/loja")}
                             class:text-gray-900={showSolidNav}
                             class:text-white={!showSolidNav}
-                            href="/web-interativa">Web Interativa</a
+                            href="/loja"
                         >
+                            Loja
+                        </a>
                     </li>
-                    -->
-                    <li>
-                        <a
-                            class="transition-colors hover:text-unrender-accent nav-link"
-                            class:text-gray-900={showSolidNav}
-                            class:text-white={!showSolidNav}
-                            href="/modelagem-3d">Modelagem 3D</a
-                        >
-                    </li>
-                    <li>
-                        <a
-                            class="transition-colors hover:text-unrender-accent nav-link"
-                            class:text-gray-900={showSolidNav}
-                            class:text-white={!showSolidNav}
-                            href="/fortnite">Fortnite</a
-                        >
-                    </li>
-                    <li>
-                        <a
-                            class="transition-colors hover:text-unrender-accent nav-link"
-                            class:text-gray-900={showSolidNav}
-                            class:text-white={!showSolidNav}
-                            href="/roblox">Roblox</a
-                        >
-                    </li>
-                    <li>
-                        <a
-                            class="transition-colors hover:text-unrender-accent nav-link"
-                            class:text-gray-900={showSolidNav}
-                            class:text-white={!showSolidNav}
-                            href="/audiovisual">AudioVisual</a
-                        >
-                    </li>
+
                     <li>
                         <button
                             type="button"
@@ -226,7 +317,7 @@
 <!-- Mobile menu overlay backdrop -->
 {#if isMobileMenuOpen}
     <div
-        class="fixed inset-0 bg-black/50 z-[55] transition-opacity duration-300"
+        class="fixed inset-0 bg-black/50 z-[1005] transition-opacity duration-300"
         on:click={closeMobileMenu}
         role="button"
         tabindex="0"
@@ -237,9 +328,11 @@
 
 <!-- Mobile menu container (Drawer) -->
 <div
-    class="fixed top-0 right-0 h-full w-64 bg-white shadow-2xl z-[60] transform transition-transform duration-300 ease-in-out"
+    class="fixed top-0 right-0 h-full w-64 bg-white shadow-2xl z-[1010] transform transition-transform duration-300 ease-in-out"
     class:translate-x-0={isMobileMenuOpen}
     class:translate-x-full={!isMobileMenuOpen}
+    class:pointer-events-none={!isMobileMenuOpen}
+    class:invisible={!isMobileMenuOpen}
     class:hidden={!isMobile && !isMobileMenuOpen}
 >
     <div class="flex flex-col h-full">
@@ -268,59 +361,104 @@
         <ul class="py-2 space-y-1 overflow-y-auto">
             <li>
                 <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
+                    class={getMobileLinkClass($page.url.pathname === '/')}
                     href="/"
                     on:click={handleNavigation}>Início</a
                 >
             </li>
             <li>
                 <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
+                    class={getMobileLinkClass($page.url.pathname.startsWith('/jogos'))}
                     href="/jogos"
                     on:click={handleNavigation}>Jogos</a
                 >
             </li>
-            <!--
-                Temporarily hidden: "Web Interativa" is not ready for public
-                use. To re-enable, remove this comment block and the surrounding
-                HTML comment. Date: 2026-02-04
-            -->
-            <!--
             <li>
-                <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
-                    href="/web-interativa"
-                    on:click={handleNavigation}>Web Interativa</a
+                <button
+                    type="button"
+                    class={getMobileBtnClass(isServiceActive)}
+                    on:click={() =>
+                        (isMobileServicesOpen = !isMobileServicesOpen)}
                 >
+                    <span>Serviços</span>
+                    <svg
+                        class="w-4 h-4 transition-transform duration-200"
+                        class:rotate-180={isMobileServicesOpen}
+                        fill="none"
+                        stroke="currentColor"
+                        viewBox="0 0 24 24"
+                    >
+                        <path
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            stroke-width="2"
+                            d="M19 9l-7 7-7-7"
+                        />
+                    </svg>
+                </button>
+                {#if isMobileServicesOpen}
+                    <ul class="bg-gray-50 py-1 pl-4">
+                        <li>
+                            <a
+                                href="/jogos"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/jogos'))}
+                                on:click={handleNavigation}>Jogos</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="/vr"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/vr'))}
+                                on:click={handleNavigation}>VR/AR</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="/audiovisual"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/audiovisual'))}
+                                on:click={handleNavigation}>Audiovisual</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="/gamificacao"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/gamificacao'))}
+                                on:click={handleNavigation}>Gamificação</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="/fortnite"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/fortnite'))}
+                                on:click={handleNavigation}>Fortnite</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="/roblox"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/roblox'))}
+                                on:click={handleNavigation}>Roblox</a
+                            >
+                        </li>
+
+                        <li>
+                            <a
+                                href="/web-interativa"
+                                class={getMobileSubLinkClass($page.url.pathname.startsWith('/web-interativa'))}
+                                on:click={handleNavigation}>Web Interativa</a
+                            >
+                        </li>
+                    </ul>
+                {/if}
             </li>
-            -->
             <li>
                 <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
-                    href="/modelagem-3d"
-                    on:click={handleNavigation}>Modelagem 3D</a
+                    class={getMobileLinkClass($page.url.pathname.startsWith('/loja'))}
+                    href="/loja"
+                    on:click={handleNavigation}
                 >
-            </li>
-            <li>
-                <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
-                    href="/fortnite"
-                    on:click={handleNavigation}>Fortnite</a
-                >
-            </li>
-            <li>
-                <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
-                    href="/roblox"
-                    on:click={handleNavigation}>Roblox</a
-                >
-            </li>
-            <li>
-                <a
-                    class="block px-6 py-3 text-gray-800 font-medium hover:bg-gray-50 hover:text-unrender-accent transition-colors border-l-4 border-transparent hover:border-unrender-accent"
-                    href="/audiovisual"
-                    on:click={handleNavigation}>AudioVisual</a
-                >
+                    Loja
+                </a>
             </li>
             <li>
                 <button
@@ -337,6 +475,8 @@
 </div>
 
 <ContactModal />
+<PortfolioModal />
+<IframeModal />
 
 <style>
     :global(:root) {
@@ -347,8 +487,8 @@
         font-family: "Montserrat", "Roboto", "Inter", sans-serif !important;
         transition:
             background-color 0.4s ease-out,
-            backdrop-filter 0.4s ease-out;
-        transition: padding 0.4s ease-out;
+            backdrop-filter 0.4s ease-out,
+            padding 0.4s ease-out;
     }
 
     .navbar .navbar-brand,
@@ -404,13 +544,5 @@
     .navbar.scrolled .nav-link:focus,
     .navbar.scrolled .nav-link.active {
         color: var(--unrender-accent) !important;
-    }
-
-    .navbar.scrolled .navbar-toggler-icon {
-        background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3e%3cpath stroke='rgba(10, 25, 47, 0.8)' stroke-linecap='round' stroke-miterlimit='10' stroke-width='2' d='M4 7h22M4 15h22M4 23h22'/%3e%3c/svg%3e");
-    }
-
-    .navbar .navbar-toggler-icon {
-        background-image: url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 30 30'%3e%3cpath stroke='rgba(10, 25, 47, 0.8)' stroke-linecap='round' stroke-miterlimit='10' stroke-width='2' d='M4 7h22M4 15h22M4 23h22'/%3e%3c/svg%3e");
     }
 </style>

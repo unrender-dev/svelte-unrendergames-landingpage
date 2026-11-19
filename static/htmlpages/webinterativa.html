@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Motion Playground</title>
+    <style>
+        :root {
+            --body-padding: 16px;
+            --container-gap: 24px;
+            --shape-size: 60px;
+            --shape-border-radius: 16px;
+            --shape-font-size: 24px;
+            --toggle-w: 90px;
+            --toggle-h: 46px;
+            --toggle-handle-size: 38px;
+            --exit-size: 70px;
+            --stagger-item-size: 40px;
+            --stagger-top: -60px;
+            --stagger-gap: 16px;
+            --drag-track-w: 160px;
+            --drag-track-h: 52px;
+            --gear-size: 44px;
+            --card-3d-size: 40px;
+            --cube-face-size: 22.5px;
+            --cube-translate: 11.25px;
+            --voxel-size: 12px;
+            --voxel-translate: 6px;
+        }
+
+        @media (max-width: 600px) {
+            :root {
+                --body-padding: 8px;
+                --container-gap: 16px;
+                --shape-size: 44px;
+                --shape-border-radius: 12px;
+                --shape-font-size: 18px;
+                --toggle-w: 72px;
+                --toggle-h: 38px;
+                --toggle-handle-size: 30px;
+                --exit-size: 55px;
+                --stagger-item-size: 32px;
+                --stagger-top: -50px;
+                --stagger-gap: 10px;
+                --drag-track-w: 130px;
+                --drag-track-h: 44px;
+                --gear-size: 36px;
+                --card-3d-size: 30px;
+                --cube-face-size: 16.5px;
+                --cube-translate: 8.25px;
+                --voxel-size: 9px;
+                --voxel-translate: 4.5px;
+            }
+        }
+
+        @media (max-width: 400px) {
+            :root {
+                --body-padding: 4px;
+                --container-gap: 10px;
+                --shape-size: 34px;
+                --shape-border-radius: 8px;
+                --shape-font-size: 14px;
+                --toggle-w: 58px;
+                --toggle-h: 30px;
+                --toggle-handle-size: 24px;
+                --exit-size: 42px;
+                --stagger-item-size: 26px;
+                --stagger-top: -42px;
+                --stagger-gap: 8px;
+                --drag-track-w: 100px;
+                --drag-track-h: 34px;
+                --gear-size: 28px;
+                --card-3d-size: 24px;
+                --cube-face-size: 12.75px;
+                --cube-translate: 6.375px;
+                --voxel-size: 7px;
+                --voxel-translate: 3.5px;
+            }
+        }
+
+        body {
+            margin: 0;
+            padding: var(--body-padding);
+            box-sizing: border-box;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background-color: transparent;
+            overflow: hidden;
+        }
+
+        #root {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            display: flex;
+            flex-direction: column;
+            gap: var(--container-gap);
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
+            padding: 12px;
+        }
+
+        .buttons-grid {
+            display: flex;
+            flex-wrap: nowrap;
+            flex-direction: row;
+            gap: var(--container-gap);
+            justify-content: center;
+            align-items: center;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        @media (max-width: 600px) {
+            .buttons-grid {
+                display: grid;
+                grid-template-columns: repeat(4, auto);
+                grid-template-rows: repeat(2, auto);
+                gap: var(--container-gap);
+                justify-content: center;
+                align-items: center;
+                width: auto;
+            }
+        }
+
+        /* Common Shape Styling */
+        .shape {
+            width: var(--shape-size);
+            height: var(--shape-size);
+            border-radius: var(--shape-border-radius);
+            cursor: pointer;
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: white;
+            font-size: var(--shape-font-size);
+        }
+
+        /* Bouncing Toggle */
+        .toggle-container {
+            width: var(--toggle-w);
+            height: var(--toggle-h);
+            border-radius: 50px;
+            display: flex;
+            align-items: center;
+            padding: 4px;
+            cursor: pointer;
+            box-sizing: border-box;
+            box-shadow: inset 0 2px 10px rgba(0, 0, 0, 0.5);
+            transition: background-color 0.3s ease;
+            position: relative;
+        }
+
+        .toggle-handle {
+            width: var(--toggle-handle-size);
+            height: var(--toggle-handle-size);
+            background-color: white;
+            border-radius: 50%;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.3);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #333;
+            font-size: calc(var(--shape-font-size) * 0.8);
+        }
+
+        .exit-wrapper {
+            width: var(--exit-size);
+            height: var(--exit-size);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* Stagger Container */
+        .stagger-wrapper {
+            position: relative;
+            display: flex;
+            justify-content: center;
+        }
+
+        .stagger-container {
+            position: absolute;
+            top: var(--stagger-top);
+            display: flex;
+            gap: var(--stagger-gap);
+            pointer-events: none;
+            z-index: 50;
+        }
+
+        .stagger-item {
+            width: var(--stagger-item-size);
+            height: var(--stagger-item-size);
+            background: rgba(0, 255, 170, 0.85);
+            border-radius: 50%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #121212;
+            font-size: calc(var(--shape-font-size) * 0.8);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            pointer-events: auto;
+        }
+
+        /* Fixed Drag Track */
+        .drag-track {
+            width: var(--drag-track-w);
+            height: var(--drag-track-h);
+            background: rgba(255, 255, 255, 0.08);
+            border-radius: 30px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            box-shadow: inset 0 5px 15px rgba(0, 0, 0, 0.3);
+        }
+
+        /* 3D Cube Scene Styles */
+        .cube-3d {
+            transform-style: preserve-3d;
+        }
+
+        .cube-face {
+            position: absolute;
+            width: var(--cube-face-size);
+            height: var(--cube-face-size);
+            border: 2px solid #f99126;
+            background: rgba(249, 145, 38, 0.2);
+            box-sizing: border-box;
+            box-shadow: inset 0 0 6px rgba(249, 145, 38, 0.5);
+            border-radius: 4px;
+        }
+
+        .face-front {
+            transform: rotateY(0deg) translateZ(var(--cube-translate));
+        }
+
+        .face-back {
+            transform: rotateY(180deg) translateZ(var(--cube-translate));
+        }
+
+        .face-right {
+            transform: rotateY(90deg) translateZ(var(--cube-translate));
+        }
+
+        .face-left {
+            transform: rotateY(-90deg) translateZ(var(--cube-translate));
+        }
+
+        .face-top {
+            transform: rotateX(90deg) translateZ(var(--cube-translate));
+        }
+
+        .face-bottom {
+            transform: rotateX(-90deg) translateZ(var(--cube-translate));
+        }
+
+        /* Voxel 3D Cube Scene Styles */
+        .voxel-face {
+            position: absolute;
+            width: var(--voxel-size);
+            height: var(--voxel-size);
+            border: 1px solid #f99126;
+            background: rgba(249, 145, 38, 0.35);
+            box-sizing: border-box;
+            border-radius: 2px;
+            box-shadow: inset 0 0 3px rgba(249, 145, 38, 0.7);
+        }
+
+        .voxel-front {
+            transform: rotateY(0deg) translateZ(var(--voxel-translate));
+        }
+
+        .voxel-back {
+            transform: rotateY(180deg) translateZ(var(--voxel-translate));
+        }
+
+        .voxel-right {
+            transform: rotateY(90deg) translateZ(var(--voxel-translate));
+        }
+
+        .voxel-left {
+            transform: rotateY(-90deg) translateZ(var(--voxel-translate));
+        }
+
+        .voxel-top {
+            transform: rotateX(90deg) translateZ(var(--voxel-translate));
+        }
+
+        .voxel-bottom {
+            transform: rotateX(-90deg) translateZ(var(--voxel-translate));
+        }
+    </style>
+
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+
+    <script src="https://unpkg.com/framer-motion@10.16.4/dist/framer-motion.js"></script>
+
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { motion, AnimatePresence, useMotionValue, useTransform } = window.Motion;
+        const { useState, useEffect, useRef } = React;
+
+        function VoxelCube({ mx, my, mz, offset, isExploded }) {
+            const bx = mx * offset;
+            const by = my * offset;
+            const bz = mz * offset;
+
+            const factor = isExploded ? 3.2 : 1.0;
+            const tx = bx * factor;
+            const ty = by * factor;
+            const tz = bz * factor;
+
+            return (
+                <motion.div
+                    style={{
+                        position: "absolute",
+                        width: "var(--voxel-size)",
+                        height: "var(--voxel-size)",
+                        transformStyle: "preserve-3d",
+                    }}
+                    animate={{
+                        x: tx,
+                        y: ty,
+                        z: tz,
+                        rotateX: isExploded ? [0, 180, 360] : 0,
+                        rotateY: isExploded ? [0, 180, 360] : 0,
+                        scale: isExploded ? 0.6 : 1.0,
+                    }}
+                    transition={{
+                        type: "spring",
+                        stiffness: isExploded ? 120 : 250,
+                        damping: isExploded ? 10 : 22
+                    }}
+                >
+                    <div className="voxel-face voxel-front" />
+                    <div className="voxel-face voxel-back" />
+                    <div className="voxel-face voxel-right" />
+                    <div className="voxel-face voxel-left" />
+                    <div className="voxel-face voxel-top" />
+                    <div className="voxel-face voxel-bottom" />
+                </motion.div>
+            );
+        }
+
+        function App() {
+            const [isToggled, setIsToggled] = useState(false);
+            const [isVisible, setIsVisible] = useState(true);
+            const [isMenuOpen, setIsMenuOpen] = useState(false);
+            const [isStaggerOpen, setIsStaggerOpen] = useState(false);
+            const [isCubeSpinned, setIsCubeSpinned] = useState(false);
+            const [isExploded, setIsExploded] = useState(false);
+            const [voxelOffset, setVoxelOffset] = useState(6);
+
+            const containerRef = useRef(null);
+            const trackRef = useRef(null);
+
+            // Auto-respawn for Exit component
+            useEffect(() => {
+                if (!isVisible) {
+                    const timer = setTimeout(() => setIsVisible(true), 1500);
+                    return () => clearTimeout(timer);
+                }
+            }, [isVisible]);
+
+            // Window resize listener to dynamically change the voxelOffset
+            useEffect(() => {
+                const handleResize = () => {
+                    if (window.innerWidth <= 400) {
+                        setVoxelOffset(3.5);
+                    } else if (window.innerWidth <= 600) {
+                        setVoxelOffset(4.5);
+                    } else {
+                        setVoxelOffset(6);
+                    }
+                };
+                handleResize();
+                window.addEventListener("resize", handleResize);
+                return () => window.removeEventListener("resize", handleResize);
+            }, []);
+
+            const voxelConfig = [
+                { x: -1, y: -1, z: -1 },
+                { x: 1, y: -1, z: -1 },
+                { x: -1, y: 1, z: -1 },
+                { x: 1, y: 1, z: -1 },
+                { x: -1, y: -1, z: 1 },
+                { x: 1, y: -1, z: 1 },
+                { x: -1, y: 1, z: 1 },
+                { x: 1, y: 1, z: 1 }
+            ];
+
+            // Values for Dynamic Drag Slider - mapped cleanly to the [-60, 60] constraint
+            const x = useMotionValue(0);
+            const dragColor = useTransform(x, [-60, 0, 60], ["#ff0088", "#7700ff", "#00ccff"]);
+            const dragRotate = useTransform(x, [-60, 60], [-180, 180]);
+
+            // Variants for Staggered Animation
+            const staggerContainerVariants = {
+                hidden: { opacity: 0 },
+                show: {
+                    opacity: 1,
+                    transition: { staggerChildren: 0.1, delayChildren: 0.05 }
+                }
+            };
+
+            const staggerItemVariants = {
+                hidden: { y: 20, opacity: 0, scale: 0.5 },
+                show: { y: 0, opacity: 1, scale: 1, transition: { type: "spring", stiffness: 400, damping: 20 } },
+                exit: { opacity: 0, scale: 0.5, transition: { duration: 0.2 } }
+            };
+
+            return (
+                <div className="container" ref={containerRef}>
+                    <div className="buttons-grid">
+                        {/* 1. Hover, Tap, Rotate */}
+                        <motion.div
+                            className="shape"
+                            style={{ backgroundColor: "#ff0088" }}
+                            whileHover={{ scale: 1.2, rotate: 90 }}
+                            whileTap={{ scale: 0.8, rotate: -90, borderRadius: "100%" }}
+                        >
+                            <i className="fa-solid fa-wand-magic-sparkles"></i>
+                        </motion.div>
+
+                        {/* 2. Free Drag */}
+                        <motion.div
+                            className="shape"
+                            style={{ backgroundColor: "#00ccff", borderRadius: "50%" }}
+                            drag
+                            dragConstraints={containerRef}
+                            whileDrag={{ scale: 1.1, cursor: "grabbing" }}
+                        >
+                            <i className="fa-solid fa-arrows-up-down-left-right"></i>
+                        </motion.div>
+
+                        {/* 3. Wobble Keyframes */}
+                        <motion.div
+                            className="shape"
+                            style={{ backgroundColor: "#ffaa00" }}
+                            animate={{
+                                rotate: [0, -20, 20, -20, 20, 0],
+                                y: [0, -25, 0, -25, 0]
+                            }}
+                            transition={{
+                                duration: 2,
+                                ease: "easeInOut",
+                                times: [0, 0.2, 0.5, 0.8, 1],
+                                repeat: Infinity,
+                                repeatDelay: 0.8
+                            }}
+                        >
+                            <i className="fa-solid fa-bell"></i>
+                        </motion.div>
+
+                        {/* 4. Bouncing Toggle */}
+                        <div
+                            className="toggle-container"
+                            style={{
+                                justifyContent: isToggled ? "flex-end" : "flex-start",
+                                backgroundColor: isToggled ? "rgba(0, 255, 170, 0.85)" : "rgba(255,255,255,0.1)"
+                            }}
+                            onClick={() => setIsToggled(!isToggled)}
+                        >
+                            <motion.div
+                                className="toggle-handle"
+                                layout
+                                transition={{ type: "spring", stiffness: 600, damping: 20 }}
+                            >
+                                <AnimatePresence mode="wait" initial={false}>
+                                    <motion.i
+                                        key={isToggled ? "check" : "x"}
+                                        className={isToggled ? "fa-solid fa-check" : "fa-solid fa-minus"}
+                                        initial={{ opacity: 0, scale: 0.5 }}
+                                        animate={{ opacity: 1, scale: 1 }}
+                                        exit={{ opacity: 0, scale: 0.5 }}
+                                        transition={{ duration: 0.15 }}
+                                    />
+                                </AnimatePresence>
+                            </motion.div>
+                        </div>
+
+                        {/* 5. Enter / Exit Component */}
+                        <div className="exit-wrapper">
+                            <AnimatePresence>
+                                {isVisible && (
+                                    <motion.div
+                                        className="shape"
+                                        style={{ backgroundColor: "#8800ff" }}
+                                        initial={{ opacity: 0, scale: 0.5, rotate: -180 }}
+                                        animate={{ opacity: 1, scale: 1, rotate: 0 }}
+                                        exit={{ opacity: 0, scale: 0, rotate: 180, filter: "blur(10px)" }}
+                                        transition={{ duration: 0.4 }}
+                                        onClick={() => setIsVisible(false)}
+                                    >
+                                        <i className="fa-solid fa-ghost"></i>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+                        </div>
+
+                        {/* 6. Interactive 3D Cube */}
+                        <motion.div
+                            className="shape"
+                            style={{
+                                backgroundColor: "#222",
+                                border: "2px solid #555",
+                                position: "relative",
+                                perspective: "200px",
+                                overflow: "visible"
+                            }}
+                            whileHover={{
+                                scale: 1.15,
+                                borderColor: "#f99126",
+                                boxShadow: "0 0 20px rgba(249, 145, 38, 0.5)"
+                            }}
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => {
+                                setIsCubeSpinned(prev => !prev);
+                            }}
+                        >
+                            <motion.div
+                                className="cube-3d"
+                                animate={{
+                                    rotateX: isCubeSpinned ? [0, 360, 720] : [0, 360],
+                                    rotateY: isCubeSpinned ? [0, 360, 720] : [0, 360]
+                                }}
+                                transition={{
+                                    duration: isCubeSpinned ? 2 : 4,
+                                    ease: "linear",
+                                    repeat: Infinity
+                                }}
+                                style={{
+                                    width: "var(--cube-face-size)",
+                                    height: "var(--cube-face-size)",
+                                    position: "relative",
+                                    transformStyle: "preserve-3d"
+                                }}
+                            >
+                                <div className="cube-face face-front" />
+                                <div className="cube-face face-back" />
+                                <div className="cube-face face-right" />
+                                <div className="cube-face face-left" />
+                                <div className="cube-face face-top" />
+                                <div className="cube-face face-bottom" />
+                            </motion.div>
+                        </motion.div>
+
+                        {/* 7. Interactive 3D Voxel Cube (Unrender Logo) */}
+                        <motion.div
+                            className="shape"
+                            style={{
+                                backgroundColor: "#222",
+                                border: "2px solid #555",
+                                position: "relative",
+                                perspective: "300px",
+                                overflow: "visible",
+                                display: "flex",
+                                justifyContent: "center",
+                                alignItems: "center"
+                            }}
+                            whileHover={{
+                                scale: 1.15,
+                                borderColor: "#f99126",
+                                boxShadow: "0 0 20px rgba(249, 145, 38, 0.5)"
+                            }}
+                            whileTap={{ scale: 0.95 }}
+                            onClick={() => {
+                                if (!isExploded) {
+                                    setIsExploded(true);
+                                    setTimeout(() => setIsExploded(false), 1500);
+                                }
+                            }}
+                        >
+                            <motion.div
+                                style={{
+                                    width: "0px",
+                                    height: "0px",
+                                    position: "relative",
+                                    transformStyle: "preserve-3d"
+                                }}
+                                animate={{
+                                    rotateX: isExploded ? [0, 360] : [0, 360],
+                                    rotateY: isExploded ? [0, 360] : [0, 360]
+                                }}
+                                transition={{
+                                    duration: isExploded ? 6 : 8,
+                                    ease: "linear",
+                                    repeat: Infinity
+                                }}
+                            >
+                                {voxelConfig.map((vox, idx) => (
+                                    <VoxelCube
+                                        key={idx}
+                                        mx={vox.x}
+                                        my={vox.y}
+                                        mz={vox.z}
+                                        offset={voxelOffset}
+                                        isExploded={isExploded}
+                                    />
+                                ))}
+                            </motion.div>
+                        </motion.div>
+
+                        {/* 7.5. Hamburger Menu on Red Button */}
+                        <div className="stagger-wrapper">
+                            <AnimatePresence>
+                                {isStaggerOpen && (
+                                    <motion.div
+                                        className="stagger-container"
+                                        variants={staggerContainerVariants}
+                                        initial="hidden"
+                                        animate="show"
+                                        exit="hidden"
+                                    >
+                                        <motion.div variants={staggerItemVariants} className="stagger-item"><i className="fa-solid fa-gamepad"></i></motion.div>
+                                        <motion.div variants={staggerItemVariants} className="stagger-item"><i className="fa-solid fa-headphones"></i></motion.div>
+                                        <motion.div variants={staggerItemVariants} className="stagger-item"><i className="fa-solid fa-music"></i></motion.div>
+                                    </motion.div>
+                                )}
+                            </AnimatePresence>
+
+                            <motion.div
+                                className="shape"
+                                style={{ backgroundColor: isStaggerOpen ? "#cc0000" : "#ff0000" }}
+                                onClick={() => setIsStaggerOpen(!isStaggerOpen)}
+                                whileTap={{ scale: 0.9 }}
+                            >
+                                <svg width="65%" height="65%" viewBox="0 0 50 50">
+                                    <motion.path
+                                        stroke="white" strokeWidth="4" strokeLinecap="round"
+                                        animate={{ d: isStaggerOpen ? "M 15 15 L 35 35" : "M 10 15 L 40 15" }}
+                                        transition={{ type: "spring", stiffness: 300, damping: 20 }}
+                                    />
+                                    <motion.path
+                                        stroke="white" strokeWidth="4" strokeLinecap="round"
+                                        animate={{ d: isStaggerOpen ? "M 25 25 L 25 25" : "M 10 25 L 40 25", opacity: isStaggerOpen ? 0 : 1 }}
+                                        transition={{ type: "spring", stiffness: 300, damping: 20 }}
+                                    />
+                                    <motion.path
+                                        stroke="white" strokeWidth="4" strokeLinecap="round"
+                                        animate={{ d: isStaggerOpen ? "M 15 35 L 35 15" : "M 10 35 L 40 35" }}
+                                        transition={{ type: "spring", stiffness: 300, damping: 20 }}
+                                    />
+                                </svg>
+                            </motion.div>
+                        </div>
+                    </div>
+
+                    {/* 8. Fixed Dynamic Drag Slider */}
+                    <div className="drag-track" ref={trackRef}>
+                        <motion.div
+                            className="shape"
+                            style={{
+                                width: "var(--gear-size)", height: "var(--gear-size)", borderRadius: "50%",
+                                x: x,
+                                backgroundColor: dragColor,
+                                rotate: dragRotate,
+                                fontSize: "calc(var(--shape-font-size) * 0.8)",
+                                boxShadow: "0 2px 10px rgba(0,0,0,0.5)"
+                            }}
+                            drag="x"
+                            dragConstraints={trackRef}
+                            dragElastic={0.1}
+                            whileDrag={{ scale: 1.1, cursor: "grabbing" }}
+                        >
+                            <i className="fa-solid fa-gear"></i>
+                        </motion.div>
+                    </div>
+
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>

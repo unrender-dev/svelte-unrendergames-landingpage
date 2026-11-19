@@ -1,0 +1,14 @@
+.git
+node_modules
+.svelte-kit
+docs
+audio
+game
+icons
+images
+models
+src
+static
+_app
+Arquivo compactado.zip
+*.zip

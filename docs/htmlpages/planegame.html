@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>WebGL Infinite Flight</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #0a0518;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            touch-action: none;
+        }
+
+        #game-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: #f99126;
+            font-size: 1.5rem;
+            font-weight: bold;
+            font-family: monospace;
+            z-index: 5;
+            pointer-events: none;
+            text-shadow: 0 0 5px #f99126;
+        }
+    </style>
+
+    <script async src="https://unpkg.com/es-module-shims@1.8.0/dist/es-module-shims.js"></script>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://cdn.jsdelivr.net/npm/three@0.164.0/build/three.module.js"
+            }
+        }
+    </script>
+</head>
+
+<body>
+
+    <div id="hud"><span id="speed-display">0</span> km/h</div>
+    <div id="game-container"></div>
+
+    <script type="module">
+        import * as THREE from 'three';
+
+        // --- Game State ---
+        let isPlaying = true;
+        let isBoosting = false;
+        const baseSpeed = 1.2;
+        const boostSpeed = 4.0; // Made turbo a bit faster!
+        let currentSpeed = baseSpeed;
+
+        let input = { x: 0, y: 0 };
+        const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+        let gyroPermissionGranted = false;
+
+        const speedDisplay = document.getElementById('speed-display');
+        const container = document.getElementById('game-container');
+
+        // --- Scene & Camera Setup ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0518);
+
+        // UPGRADE: Pushed fog way back to increase view distance
+        scene.fog = new THREE.Fog(0x0a0518, 300, 1400);
+
+        // UPGRADE: Extended camera 'far' plane from 1000 to 2000
+        const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 2000);
+
+        // --- WebGL Renderer ---
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.5; // Brightened up the overall scene slightly
+        container.appendChild(renderer.domElement);
+
+        // --- Lighting ---
+        // UPGRADE: Brightened the ambient light so the plane isn't a black silhouette
+        const ambientLight = new THREE.AmbientLight(0xffffff, 1.5);
+        scene.add(ambientLight);
+
+        const dirLight = new THREE.DirectionalLight(0xf99126, 3);
+        dirLight.position.set(100, 200, 50);
+        scene.add(dirLight);
+
+        const purpleLight = new THREE.DirectionalLight(0x5d44a2, 2);
+        purpleLight.position.set(-100, 50, -50);
+        scene.add(purpleLight);
+
+        // --- Infinite Environment ---
+        const gridSize = 40;
+        // UPGRADE: Massive grid so it extends all the way into the distant fog
+        const gridDivisions = 120;
+        const gridHelper = new THREE.GridHelper(gridSize * gridDivisions, gridDivisions, 0xf99126, 0x2a1545);
+        gridHelper.position.y = -20;
+        scene.add(gridHelper);
+
+        const particleCount = 2000;
+        const particleGeom = new THREE.BufferGeometry();
+        const particlePos = new Float32Array(particleCount * 3);
+        for (let i = 0; i < particleCount * 3; i++) {
+            // Expanded the particle spawn box to match the new view distance
+            particlePos[i * 3] = (Math.random() - 0.5) * 1000;
+            particlePos[i * 3 + 1] = (Math.random() - 0.5) * 1000;
+            particlePos[i * 3 + 2] = (Math.random() - 0.5) * 1000;
+        }
+        particleGeom.setAttribute('position', new THREE.BufferAttribute(particlePos, 3));
+        const particleMat = new THREE.PointsMaterial({ color: 0xffffff, size: 1.0, transparent: true, opacity: 0.5 });
+        const particles = new THREE.Points(particleGeom, particleMat);
+        scene.add(particles);
+
+        // --- Construct Plane ---
+        const planeGroup = new THREE.Group();
+        scene.add(planeGroup);
+
+        // UPGRADE: Lighter base color and more reflectivity so we can see the shape
+        const mat = new THREE.MeshStandardMaterial({
+            color: 0x554433,
+            roughness: 0.3,
+            metalness: 0.8,
+            emissive: 0x1a0e2e
+        });
+
+        const bodyGeom = new THREE.ConeGeometry(1, 6, 4);
+        bodyGeom.rotateX(Math.PI / 2);
+        bodyGeom.rotateZ(Math.PI / 4);
+        const body = new THREE.Mesh(bodyGeom, mat);
+        planeGroup.add(body);
+
+        const wingGeom = new THREE.BoxGeometry(9, 0.1, 2.5);
+        const wings = new THREE.Mesh(wingGeom, mat);
+        wings.position.set(0, -0.2, 1);
+        planeGroup.add(wings);
+
+        const tailGeom = new THREE.BoxGeometry(0.1, 2, 1.5);
+        const tail = new THREE.Mesh(tailGeom, mat);
+        tail.position.set(0, 1, 2);
+        planeGroup.add(tail);
+
+        // UPGRADE: Dynamic Thruster Flame
+        const flameGeom = new THREE.ConeGeometry(0.6, 3, 16);
+        flameGeom.rotateX(Math.PI / 2);
+        flameGeom.translate(0, 0, 1.5); // Offset so it scales from the base, not the center
+        const flameMat = new THREE.MeshBasicMaterial({
+            color: 0xf99126,
+            transparent: true,
+            opacity: 0.8,
+            blending: THREE.AdditiveBlending // Makes it glow like actual light/fire
+        });
+        const flame = new THREE.Mesh(flameGeom, flameMat);
+        flame.position.set(0, 0, 2.5);
+        planeGroup.add(flame);
+
+        // UPGRADE: PointLight that casts a glow on the plane and the floor grid
+        const engineLight = new THREE.PointLight(0xf99126, 5, 50);
+        engineLight.position.set(0, 0, 3);
+        planeGroup.add(engineLight);
+
+        // --- Controls & Inputs ---
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        // Listen for forwarded control events from the Svelte parent page
+        window.addEventListener('message', (event) => {
+            const data = event.data;
+            if (!data) return;
+
+            if (data.type === 'mousemove' || data.type === 'touchmove') {
+                input.x = data.x;
+                input.y = data.y;
+            } else if (data.type === 'mousedown' || data.type === 'touchstart') {
+                if (data.type === 'touchstart' && isMobile) {
+                    requestOrientationPermission();
+                }
+                startBoost();
+            } else if (data.type === 'mouseup' || data.type === 'touchend') {
+                endBoost();
+            }
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (isMobile) return;
+            input.x = (e.clientX / window.innerWidth) * 2 - 1;
+            input.y = -(e.clientY / window.innerHeight) * 2 + 1;
+        });
+
+        const startBoost = () => { isBoosting = true; };
+        const endBoost = () => { isBoosting = false; };
+
+        window.addEventListener('mousedown', startBoost);
+        window.addEventListener('mouseup', endBoost);
+        window.addEventListener('touchend', endBoost);
+
+        const handleOrientation = (e) => {
+            let roll = e.gamma || 0;
+            let pitch = e.beta || 0;
+            roll = Math.max(-45, Math.min(45, roll));
+            let adjustedPitch = pitch - 45;
+            adjustedPitch = Math.max(-30, Math.min(30, adjustedPitch));
+            input.x = roll / 45;
+            input.y = -adjustedPitch / 30;
+        };
+
+        const requestOrientationPermission = () => {
+            if (gyroPermissionGranted) return;
+            if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+                DeviceOrientationEvent.requestPermission()
+                    .then(response => {
+                        if (response == 'granted') {
+                            window.addEventListener('deviceorientation', handleOrientation);
+                            gyroPermissionGranted = true;
+                        }
+                    })
+                    .catch(console.error);
+            } else {
+                window.addEventListener('deviceorientation', handleOrientation);
+                gyroPermissionGranted = true;
+            }
+        };
+
+        window.addEventListener('touchstart', () => {
+            if (isMobile) requestOrientationPermission();
+            startBoost();
+        }, { passive: false });
+
+        if (isMobile && typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission !== 'function') {
+            window.addEventListener('deviceorientation', handleOrientation);
+            gyroPermissionGranted = true;
+        }
+
+        // --- Animation Loop ---
+        const clock = new THREE.Clock();
+        let planeYaw = 0;
+
+        function animate() {
+            const delta = clock.getDelta();
+
+            if (isPlaying) {
+                const targetSpeed = isBoosting ? boostSpeed : baseSpeed;
+                currentSpeed = THREE.MathUtils.lerp(currentSpeed, targetSpeed, delta * 5);
+                speedDisplay.innerText = Math.floor(currentSpeed * 100);
+
+                const maxRoll = Math.PI / 3;
+                const maxPitch = Math.PI / 4;
+                const targetRoll = -input.x * maxRoll;
+                const targetPitch = input.y * maxPitch;
+
+                planeGroup.rotation.z = THREE.MathUtils.lerp(planeGroup.rotation.z, targetRoll, delta * 5);
+                planeGroup.rotation.x = THREE.MathUtils.lerp(planeGroup.rotation.x, targetPitch, delta * 5);
+                planeYaw -= input.x * delta * 1.5;
+                planeGroup.rotation.y = planeYaw;
+
+                const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(planeGroup.quaternion);
+                planeGroup.position.add(forward.multiplyScalar(currentSpeed));
+
+                if (planeGroup.position.y < -15) {
+                    planeGroup.position.y = -15;
+                    input.y = Math.max(0, input.y);
+                }
+
+                // UPGRADE: Thruster Animation Logic
+                if (isBoosting) {
+                    flameMat.color.setHex(0x5d44a2); // Purple Turbo
+                    engineLight.color.setHex(0x5d44a2);
+                    engineLight.intensity = 15;
+                    // Jitter scale to simulate violent thruster fire
+                    flame.scale.set(1.2 + Math.random() * 0.2, 1.2 + Math.random() * 0.2, 2.5 + Math.random() * 1.0);
+                } else {
+                    flameMat.color.setHex(0xf99126); // Orange Default
+                    engineLight.color.setHex(0xf99126);
+                    engineLight.intensity = 6;
+                    // Calmer jitter for cruising
+                    flame.scale.set(0.8 + Math.random() * 0.1, 0.8 + Math.random() * 0.1, 1.0 + Math.random() * 0.3);
+                }
+
+                const cameraOffset = new THREE.Vector3(0, 5, 20);
+                const idealCameraPos = cameraOffset.applyMatrix4(planeGroup.matrixWorld);
+                camera.position.lerp(idealCameraPos, delta * 6);
+                const lookAtTarget = new THREE.Vector3(0, 0, -25).applyMatrix4(planeGroup.matrixWorld);
+                camera.lookAt(lookAtTarget);
+
+                gridHelper.position.x = Math.round(planeGroup.position.x / gridSize) * gridSize;
+                gridHelper.position.z = Math.round(planeGroup.position.z / gridSize) * gridSize;
+
+                // Particle Wrapping (Expanded bounds)
+                const pPositions = particles.geometry.attributes.position.array;
+                for (let i = 0; i < particleCount; i++) {
+                    const i3 = i * 3;
+                    const dx = pPositions[i3] - planeGroup.position.x;
+                    const dy = pPositions[i3 + 1] - planeGroup.position.y;
+                    const dz = pPositions[i3 + 2] - planeGroup.position.z;
+
+                    if (dx > 500) pPositions[i3] -= 1000;
+                    if (dx < -500) pPositions[i3] += 1000;
+                    if (dy > 500) pPositions[i3 + 1] -= 1000;
+                    if (dy < -500) pPositions[i3 + 1] += 1000;
+                    if (dz > 500) pPositions[i3 + 2] -= 1000;
+                    if (dz < -500) pPositions[i3 + 2] += 1000;
+                }
+                particles.geometry.attributes.position.needsUpdate = true;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        renderer.setAnimationLoop(animate);
+    </script>
+</body>
+
+</html>

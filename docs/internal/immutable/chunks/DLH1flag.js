@@ -1,0 +1,1 @@
+import{Z as e}from"./DXZhnAp4.js";const i=e({isOpen:!1,title:""}),r=e({isOpen:!1,activeTab:"jogos"}),l=e({isOpen:!1,url:""}),c=e(!0),s=typeof window<"u",t=s?sessionStorage.getItem("hasSeenSplashScreen")==="true":!1,o=e(t);s&&o.subscribe(a=>{sessionStorage.setItem("hasSeenSplashScreen",a)});export{i as c,c as g,o as h,l as i,r as p};

@@ -1,6 +1,8 @@
 <script>
-  import { onMount, onDestroy } from 'svelte';
-  import Spinner from './Spinner.svelte';
+  import { onMount, onDestroy } from "svelte";
+  import Spinner from "./Spinner.svelte";
+  import { registerRenderer, unregisterRenderer } from "./debugStore.js";
+  import { createRenderer } from "./threeRenderer.js";
   let container;
   let renderer;
   let scene;
@@ -11,22 +13,42 @@
   let scrollCleanup;
   let isLoading = true;
   let isInitialized = false;
+  let currentRenderer = 'Loading...';
+  let rendererInfo = {
+    geometries: 0,
+    textures: 0,
+    drawCalls: 0,
+    triangles: 0
+  };
 
   onMount(async () => {
     if (!isInitialized) {
-      const THREE = await import('three');
+      const THREE = await import("three");
+
+      const urlParams = new URLSearchParams(window.location.search);
 
       scene = new THREE.Scene();
-      camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 1000);
+      camera = new THREE.PerspectiveCamera(
+        45,
+        window.innerWidth / window.innerHeight,
+        0.1,
+        1000,
+      );
       camera.position.set(2, 2, 5);
 
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      const result = await createRenderer({ antialias: true, alpha: true });
+      renderer = result.renderer;
+      currentRenderer = result.currentRenderer;
+
+      // Register renderer for global debug overlay
+      registerRenderer(renderer, currentRenderer);
+
       renderer.setSize(window.innerWidth, window.innerHeight);
       renderer.setPixelRatio(window.devicePixelRatio || 1);
-      renderer.domElement.style.position = 'fixed';
-      renderer.domElement.style.top = '0';
-      renderer.domElement.style.left = '0';
-      renderer.domElement.style.zIndex = '0';
+      renderer.domElement.style.position = "fixed";
+      renderer.domElement.style.top = "0";
+      renderer.domElement.style.left = "0";
+      renderer.domElement.style.zIndex = "0";
       container.appendChild(renderer.domElement);
 
       const geometry = new THREE.BoxGeometry(1, 1, 1);
@@ -49,44 +71,49 @@
         renderer.setSize(window.innerWidth, window.innerHeight);
       };
 
-      window.addEventListener('resize', resizeHandler);
+      window.addEventListener("resize", resizeHandler);
 
       // render loop — no auto-rotation, only render the scene
-      function animate() {
+      async function animate() {
         raf = requestAnimationFrame(animate);
-        renderer.render(scene, camera);
+        if (renderer && scene && camera) {
+          if (renderer.info) renderer.info.reset();
+          
+          renderer.render(scene, camera); // init() já foi aguardado: render síncrono (sem await por frame)
+        }
       }
 
       animate();
 
       // load GSAP and ScrollTrigger to animate cube on scroll
       try {
-        const gsapModule = await import('gsap');
+        const gsapModule = await import("gsap");
         const gsap = gsapModule.gsap || gsapModule.default || gsapModule;
-        const stModule = await import('gsap/ScrollTrigger');
-        const ScrollTrigger = stModule.ScrollTrigger || stModule.default || stModule;
+        const stModule = await import("gsap/ScrollTrigger");
+        const ScrollTrigger =
+          stModule.ScrollTrigger || stModule.default || stModule;
         gsap.registerPlugin(ScrollTrigger);
 
         // animate rotation and position as the user scrolls the page
         const rotationTween = gsap.to(cube.rotation, {
           y: Math.PI * 2,
           x: Math.PI / 4,
-          ease: 'none',
+          ease: "none",
           scrollTrigger: {
             scrub: true,
-            start: 'top top',
-            end: 'bottom top'
-          }
+            start: "top top",
+            end: "bottom top",
+          },
         });
 
         const positionTween = gsap.to(cube.position, {
           y: 2,
-          ease: 'none',
+          ease: "none",
           scrollTrigger: {
             scrub: true,
-            start: 'top top',
-            end: 'bottom top'
-          }
+            start: "top top",
+            end: "bottom top",
+          },
         });
 
         // define how to clean up scroll animations
@@ -99,7 +126,7 @@
         };
       } catch (e) {
         // ignore if gsap isn't available; cube will remain static
-        console.warn('GSAP not available', e);
+        console.warn("GSAP not available", e);
       }
 
       // Mark as loaded and initialized
@@ -110,14 +137,30 @@
 
   onDestroy(() => {
     // these APIs only exist in the browser; guard for SSR
-    if (typeof cancelAnimationFrame === 'function') {
+    if (typeof cancelAnimationFrame === "function") {
       cancelAnimationFrame(raf);
     }
-    if (typeof window !== 'undefined' && resizeHandler) {
-      window.removeEventListener('resize', resizeHandler);
+    if (typeof window !== "undefined" && resizeHandler) {
+      window.removeEventListener("resize", resizeHandler);
     }
     if (scrollCleanup) scrollCleanup();
-    if (renderer) renderer.dispose();
+    if (scene) {
+      scene.traverse((child) => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach((m) => m.dispose());
+          } else {
+            child.material.dispose();
+          }
+        }
+      });
+    }
+    if (renderer) {
+      renderer.dispose?.();
+      renderer.forceContextLoss?.();
+    }
+    unregisterRenderer();
   });
 </script>
 
@@ -128,7 +171,7 @@
 <div bind:this={container} class="w-screen h-screen pointer-events-none"></div>
 
 <style>
-:global(body) {
-  margin: 0;
-}
+  :global(body) {
+    margin: 0;
+  }
 </style>

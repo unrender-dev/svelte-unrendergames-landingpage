@@ -3,17 +3,98 @@
 @tailwind utilities;
 
 /* Global resets to prevent horizontal scroll and ensure consistent box model */
-*, *::before, *::after {
+*,
+*::before,
+*::after {
   box-sizing: border-box;
+  -webkit-user-select: none;
+  -moz-user-select: none;
+  -ms-user-select: none;
+  user-select: none;
 }
 
-html, body, #svelte {
+html,
+body,
+#svelte {
   height: 100%;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+}
+
+/* Complete scrollbar elimination utility across all browsers */
+.no-scrollbar::-webkit-scrollbar {
+  display: none !important;
+  width: 0 !important;
+  height: 0 !important;
+}
+.no-scrollbar {
+  -ms-overflow-style: none !important;
+  scrollbar-width: none !important;
+}
+
+/* Custom Cyberpunk Unrender Scrollbar System */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(7, 8, 14, 0.85);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(245, 166, 35, 0.45) 0%, rgba(245, 166, 35, 0.2) 100%);
+  border: 1px solid rgba(245, 166, 35, 0.4);
+  border-radius: 9999px;
+  backdrop-filter: blur(8px);
+  transition: all 0.2s ease;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, #f5a623 0%, #ff8c00 100%);
+  border-color: #f5a623;
+  box-shadow: 0 0 14px rgba(245, 166, 35, 0.8);
+}
+
+/* Firefox standard scrollbar properties */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(245, 166, 35, 0.45) rgba(7, 8, 14, 0.85);
+}
+
+/* Specialized thin custom scrollbar for nested scrollable areas */
+.custom-scrollbar::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.custom-scrollbar-thin::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+.custom-scrollbar::-webkit-scrollbar-track,
+.custom-scrollbar-thin::-webkit-scrollbar-track {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 9999px;
+}
+.custom-scrollbar::-webkit-scrollbar-thumb,
+.custom-scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(245, 166, 35, 0.35);
+  border-radius: 9999px;
+  border: 1px solid rgba(245, 166, 35, 0.25);
+}
+.custom-scrollbar::-webkit-scrollbar-thumb:hover,
+.custom-scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(245, 166, 35, 0.85);
+  box-shadow: 0 0 10px rgba(245, 166, 35, 0.6);
 }
 
 body {
   margin: 0;
   padding: 0;
+  overflow-x: hidden;
+  max-width: 100%;
   /* Apple-like minimalist system font stack */
   font-family: -apple-system, BlinkMacSystemFont, system-ui, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   /* theme variables */
@@ -22,4 +103,59 @@ body {
 
   background: radial-gradient(ellipse at center, var(--unrender-purple) 0%, #030409 100%);
   color: white;
+}
+
+/* Ensure headings never break mid-word, scaling them using fluid typography instead or overflowing normally */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.break-keep-all {
+  word-break: keep-all !important;
+  word-wrap: normal !important;
+  overflow-wrap: normal !important;
+  hyphens: none !important;
+}
+
+/* Pixel Art FontAwesome Icon Effect */
+i.fas, i.fab, i.far, i.fa-solid, i.fa-regular, i.fa-brands, [class*="fa-"] {
+  display: inline-block !important;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: -webkit-crisp-edges;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: none;
+  font-smoothing: none;
+  text-rendering: optimizeSpeed;
+  transform: translateZ(0); /* Hardware accelerate filter rendering */
+  
+  /* Default filter */
+  filter: url(#pixelate-3px);
+}
+
+/* Size-based adjustments for readability */
+i.fa-xs, i.fa-2xs, i.fa-sm {
+  filter: url(#pixelate-2px) !important;
+}
+
+i.fa-lg {
+  filter: url(#pixelate-3px) !important;
+}
+
+i.fa-xl, i.fa-2xl, i.fa-2x, i.fa-3x, i.fa-4x, i.fa-5x {
+  filter: url(#pixelate-4px) !important;
+}
+
+/* Opt-out: ícones nítidos (sem efeito pixel art), ex.: FABs de WhatsApp e Portfólio */
+i.no-pixel,
+[class*="fa-"].no-pixel {
+  filter: none !important;
+  image-rendering: auto !important;
+  -webkit-font-smoothing: antialiased !important;
+  -moz-osx-font-smoothing: grayscale !important;
+  text-rendering: geometricPrecision !important;
+  transform: none !important;
 }
